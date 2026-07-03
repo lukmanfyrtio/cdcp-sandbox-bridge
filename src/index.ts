@@ -62,8 +62,15 @@ async function driveReader(conn: VpcdConnection): Promise<void> {
     if (atr.length > 0 && !cardPresent) {
       cardPresent = true;
       console.log(`Card in field, ATR=${bytesToHex(atr)}`);
+      // Verbose APDU tracing so real-card read issues are diagnosable from the console.
+      const tracedTransceive = async (capdu: Uint8Array) => {
+        console.log(`  → ${bytesToHex(capdu)}`);
+        const rapdu = await conn.transceive(capdu);
+        console.log(`  ← ${bytesToHex(rapdu)}`);
+        return rapdu;
+      };
       try {
-        const card = await readEmvCard((capdu) => conn.transceive(capdu), (m) => console.log("  " + m));
+        const card = await readEmvCard(tracedTransceive, (m) => console.log("  " + m));
         console.log(`Read PAN ${card.pan.slice(0, 6)}****${card.pan.slice(-4)} (${card.scheme})`);
         hub.broadcast({ type: "card_read", card });
       } catch (e: any) {

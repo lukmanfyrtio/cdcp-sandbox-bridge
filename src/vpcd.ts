@@ -50,8 +50,20 @@ export class VpcdConnection extends EventEmitter {
     socket.on("data", (chunk) => {
       for (const msg of this.framer.push(chunk)) this.handleMessage(msg);
     });
-    socket.on("close", () => this.emit("close"));
+    socket.on("close", () => {
+      this.rejectPending(new Error("reader connection closed"));
+      this.emit("close");
+    });
     socket.on("error", (e) => this.emit("error", e));
+  }
+
+  private pendingRejectors: ((err: Error) => void)[] = [];
+
+  private rejectPending(err: Error) {
+    this.pendingResolvers = [];
+    const rejectors = this.pendingRejectors;
+    this.pendingRejectors = [];
+    for (const reject of rejectors) reject(err);
   }
 
   private handleMessage(msg: Uint8Array) {
@@ -63,15 +75,26 @@ export class VpcdConnection extends EventEmitter {
   private send(payload: Uint8Array): Promise<Uint8Array> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const idx = this.pendingResolvers.indexOf(wrapped);
-        if (idx >= 0) this.pendingResolvers.splice(idx, 1);
+        cleanup();
         reject(new Error("VPCD response timeout"));
       }, 8000);
-      const wrapped = (msg: Uint8Array) => {
+      const cleanup = () => {
         clearTimeout(timer);
+        const ri = this.pendingResolvers.indexOf(wrapped);
+        if (ri >= 0) this.pendingResolvers.splice(ri, 1);
+        const ji = this.pendingRejectors.indexOf(rejector);
+        if (ji >= 0) this.pendingRejectors.splice(ji, 1);
+      };
+      const wrapped = (msg: Uint8Array) => {
+        cleanup();
         resolve(msg);
       };
+      const rejector = (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      };
       this.pendingResolvers.push(wrapped);
+      this.pendingRejectors.push(rejector);
       this.socket.write(encodeMessage(payload));
     });
   }
