@@ -17,87 +17,82 @@ export function readRecord(record: number, sfi: number): Uint8Array {
   return Uint8Array.of(0x00, 0xb2, record, p2, 0x00);
 }
 
-/** Default terminal values for PDOL tags, keyed by uppercase hex tag. Tunable per acquirer/scheme. */
-function defaultPdolValue(tag: string, length: number): Uint8Array {
-  const out = new Uint8Array(length);
-  const set = (hex: string) => {
-    const b = hexToBytes(hex);
-    out.set(b.slice(0, length), Math.max(0, length - b.length));
+/**
+ * Terminal-generated values for a real transaction — amount comes from the user's actual input
+ * (must be known before GENERATE AC, since the cryptogram is computed over it), the rest are
+ * either fixed sandbox terminal config or generated fresh per transaction (date, unpredictable
+ * number). Reused for BOTH the CDOL1 fill (sent to the card) and the field 55 tag collection
+ * (sent to the host) so the two always agree on what was actually used.
+ */
+export function generateTerminalTags(amountRupiah: number): Record<string, Uint8Array> {
+  const amountCents = Math.max(0, Math.round(amountRupiah));
+  const un = new Uint8Array(4);
+  for (let i = 0; i < 4; i++) un[i] = Math.floor(Math.random() * 256);
+  const d = new Date();
+  const dateHex = `${String(d.getFullYear() % 100).padStart(2, "0")}${String(d.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}${String(d.getDate()).padStart(2, "0")}`;
+
+  return {
+    "9F02": hexToBytes(amountCents.toString().padStart(12, "0")), // Amount, Authorised (BCD)
+    "9F03": hexToBytes("000000000000"), // Amount, Other
+    "9F1A": hexToBytes("0360"), // Terminal Country Code (ID)
+    "5F2A": hexToBytes("0360"), // Transaction Currency Code (IDR)
+    "95": hexToBytes("0000000000"), // Terminal Verification Results — sandbox does no real risk mgmt
+    "9A": hexToBytes(dateHex), // Transaction Date YYMMDD
+    "9C": hexToBytes("00"), // Transaction Type — 00 = purchase
+    "9F37": un, // Unpredictable Number
+    "9F66": hexToBytes("36000000"), // TTQ (Visa qVSDC + contactless read)
+    "9F35": hexToBytes("22"), // Terminal Type
+    "9F40": hexToBytes("6000000000"), // Additional Terminal Capabilities
   };
-  switch (tag) {
-    case "9F66": // TTQ (Terminal Transaction Qualifiers) — Visa qVSDC + contactless read
-      set("36000000");
-      break;
-    case "9F02": // Amount, Authorised (BCD)
-      set("000000000100");
-      break;
-    case "9F03": // Amount, Other
-      set("000000000000");
-      break;
-    case "9F1A": // Terminal Country Code (ID = 0360)
-      set("0360");
-      break;
-    case "5F2A": // Transaction Currency Code (IDR = 0360)
-      set("0360");
-      break;
-    case "95": // Terminal Verification Results
-      set("0000000000");
-      break;
-    case "9A": {
-      // Transaction Date YYMMDD
-      const d = new Date();
-      set(
-        `${String(d.getFullYear() % 100).padStart(2, "0")}${String(d.getMonth() + 1).padStart(2, "0")}${String(
-          d.getDate()
-        ).padStart(2, "0")}`
-      );
-      break;
-    }
-    case "9C": // Transaction Type
-      set("00");
-      break;
-    case "9F37": {
-      // Unpredictable Number (random)
-      for (let i = 0; i < length; i++) out[i] = Math.floor(Math.random() * 256);
-      break;
-    }
-    case "9F35": // Terminal Type
-      set("22");
-      break;
-    case "9F40": // Additional Terminal Capabilities
-      set("6000000000");
-      break;
-    case "9F4E": // Merchant Name and Location
-      break; // zeros
-    default:
-      break; // zeros of requested length
-  }
+}
+
+function fitLength(value: Uint8Array, length: number): Uint8Array {
+  if (value.length === length) return value;
+  const out = new Uint8Array(length);
+  out.set(value.slice(0, length), Math.max(0, length - value.length));
   return out;
 }
 
-/** Parse a PDOL (Tag-Length list) and produce the concatenated data object list values. */
-export function buildPdolData(pdol: Uint8Array): Uint8Array {
+/**
+ * Parse a DOL (PDOL or CDOL1/2 — same Tag-Length-list format) and produce the concatenated data
+ * object list values, using `terminalTags` where available and zeros for anything unrecognized.
+ */
+export function buildPdolData(dol: Uint8Array, terminalTags: Record<string, Uint8Array> = generateTerminalTags(0)): Uint8Array {
   const parts: Uint8Array[] = [];
   let i = 0;
-  while (i < pdol.length) {
+  while (i < dol.length) {
     // tag
     const tagStart = i;
-    let tagByte = pdol[i++];
+    let tagByte = dol[i++];
     if ((tagByte & 0x1f) === 0x1f) {
-      while (i < pdol.length && (pdol[i] & 0x80) !== 0) i++;
+      while (i < dol.length && (dol[i] & 0x80) !== 0) i++;
       i++;
     }
-    const tag = bytesToHex(pdol.slice(tagStart, i));
+    const tag = bytesToHex(dol.slice(tagStart, i));
     // length
-    let length = pdol[i++];
+    let length = dol[i++];
     if (length & 0x80) {
       const n = length & 0x7f;
       length = 0;
-      for (let k = 0; k < n; k++) length = (length << 8) | pdol[i++];
+      for (let k = 0; k < n; k++) length = (length << 8) | dol[i++];
     }
-    parts.push(defaultPdolValue(tag, length));
+    parts.push(terminalTags[tag] ? fitLength(terminalTags[tag], length) : new Uint8Array(length));
   }
   return concat(...parts);
+}
+
+/**
+ * GENERATE AC — the step our old flow skipped entirely. This is what makes the real chip produce
+ * the Application Cryptogram (9F26): the terminal fills the card's own CDOL1 with real transaction
+ * data (amount, date, unpredictable number, ...) and the card computes a cryptogram over it using
+ * keys that never leave the chip. P1=0x80 requests ARQC (online authorization) — the only mode this
+ * sandbox uses, since every sale goes through sale_trx online regardless.
+ */
+export function buildGenerateAc(cdol1Data: Uint8Array): Uint8Array {
+  return concat(hexToBytes("80AE8000"), Uint8Array.of(cdol1Data.length), cdol1Data, Uint8Array.of(0x00));
 }
 
 /** Build a GET PROCESSING OPTIONS APDU. If the AID's FCI carries a PDOL, fill it; else send empty 83 00. */

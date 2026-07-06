@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readEmvCard, parseTrack2, Transceive } from "../src/emv";
 import { bytesToHex, concat, hexToBytes } from "../src/hex";
+import { findTag, parseTlv } from "../src/tlv";
 
 // Tiny TLV builder for fixtures (assumes value length < 128).
 function tlv(tagHex: string, value: Uint8Array): Uint8Array {
@@ -71,5 +72,36 @@ describe("readEmvCard", () => {
   it("throws a helpful error when PPSE fails", async () => {
     const noCard: Transceive = async () => hexToBytes("6A82");
     await expect(readEmvCard(noCard)).rejects.toThrow(/PPSE/);
+  });
+
+  it("runs GENERATE AC and assembles field-55-equivalent emvData when the card has a CDOL1", async () => {
+    // CDOL1: 9F02(6) 9F03(6) 9F1A(2) 95(5) 5F2A(2) 9A(3) 9C(1) 9F37(4) — a typical Visa CDOL1.
+    const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
+    const recordWithCdol1 = tlv("70", concat(tlv("57", hexToBytes(TRACK2_HEX)), tlv("8C", hexToBytes(CDOL1_HEX))));
+
+    // GENERATE AC response, format 1 (primitive tag 80): CID(1) + ATC(2) + AC(8) + IAD(6).
+    const gacValueHex = "80" + "0001" + "1122334455667788" + "060A03A09000";
+    const gacResponse = tlv("80", hexToBytes(gacValueHex));
+
+    const scriptedCardWithGac: Transceive = async (capdu) => {
+      if (startsWith(capdu, "00A40400" + "0E")) return withSw(ppseResponse);
+      if (startsWith(capdu, "00A40400" + "07")) return withSw(new Uint8Array(0));
+      if (startsWith(capdu, "80A80000")) return withSw(gpoResponse);
+      if (startsWith(capdu, "00B201" + "0C")) return withSw(recordWithCdol1);
+      if (startsWith(capdu, "80AE8000")) return withSw(gacResponse); // GENERATE AC
+      return hexToBytes("6A82");
+    };
+
+    const card = await readEmvCard(scriptedCardWithGac, 150000);
+    expect(card.emvData).toBeDefined();
+
+    const nodes = parseTlv(hexToBytes(card.emvData!));
+    expect(bytesToHex(findTag(nodes, "9F26")!.value)).toBe("1122334455667788"); // the cryptogram itself
+    expect(bytesToHex(findTag(nodes, "9F27")!.value)).toBe("80"); // CID
+    expect(bytesToHex(findTag(nodes, "9F36")!.value)).toBe("0001"); // ATC
+    expect(bytesToHex(findTag(nodes, "9F10")!.value)).toBe("060A03A09000"); // IAD
+    expect(bytesToHex(findTag(nodes, "82")!.value)).toBe("0000"); // AIP, from the GPO fixture
+    expect(bytesToHex(findTag(nodes, "84")!.value)).toBe(bytesToHex(VISA_AID));
+    expect(bytesToHex(findTag(nodes, "9C")!.value)).toBe("00"); // transaction type = purchase
   });
 });

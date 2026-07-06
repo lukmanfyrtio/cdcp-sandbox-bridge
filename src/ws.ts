@@ -14,6 +14,10 @@ export class WsHub {
   private wss: WebSocketServer;
   private clients = new Set<WebSocket>();
   private lastStatus: BridgeEvent = { type: "reader_disconnected" };
+  // Amount the browser armed before the next tap — GENERATE AC needs the real amount to compute a
+  // valid cryptogram, and the only way this bridge (which doesn't know about "amount" otherwise)
+  // finds out is the client telling it right before the user taps. Defaults to 0 if never armed.
+  private pendingAmount = 0;
 
   constructor(server: http.Server) {
     this.wss = new WebSocketServer({ server });
@@ -23,7 +27,19 @@ export class WsHub {
       ws.send(JSON.stringify(this.lastStatus));
       ws.on("close", () => this.clients.delete(ws));
       ws.on("error", () => this.clients.delete(ws));
+      ws.on("message", (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg?.type === "arm_tap" && typeof msg.amount === "number") this.pendingAmount = msg.amount;
+        } catch {
+          /* ignore malformed client messages */
+        }
+      });
     });
+  }
+
+  takePendingAmount(): number {
+    return this.pendingAmount;
   }
 
   broadcast(event: BridgeEvent): void {

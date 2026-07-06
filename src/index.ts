@@ -70,8 +70,13 @@ async function driveReader(conn: VpcdConnection): Promise<void> {
         return rapdu;
       };
       try {
-        const card = await readEmvCard(tracedTransceive, (m) => console.log("  " + m));
-        console.log(`Read PAN ${card.pan.slice(0, 6)}****${card.pan.slice(-4)} (${card.scheme})`);
+        const amount = hub.takePendingAmount();
+        const card = await readEmvCard(tracedTransceive, amount, (m) => console.log("  " + m));
+        // Full dump of everything extracted from this card — masked PAN only, everything else as-is.
+        console.log("Read result:", {
+          ...card,
+          pan: `${card.pan.slice(0, 6)}${"*".repeat(Math.max(0, card.pan.length - 10))}${card.pan.slice(-4)}`,
+        });
         hub.broadcast({ type: "card_read", card });
       } catch (e: any) {
         const message = e?.message ?? String(e);
