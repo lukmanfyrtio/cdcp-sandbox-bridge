@@ -145,6 +145,8 @@ export async function readEmvCard(
   amountRupiah = 0,
   log: (msg: string) => void = () => {}
 ): Promise<CardData> {
+  let emvData: string | undefined;
+
   // 1. SELECT PPSE
   const ppse = splitSw(await transceive(selectPpse()));
   if (ppse.sw !== "9000") throw new Error(`SELECT PPSE failed (SW ${ppse.sw})`);
@@ -221,13 +223,53 @@ export async function readEmvCard(
     log(`PAN ${extracted.pan.slice(0, 6)}******${extracted.pan.slice(-4)}, exp ${extracted.expiryYYMM}, scheme ${schemeFromAid(aidHex)}`);
     if (extracted.cardholderName) log(`Cardholder name: ${extracted.cardholderName}`);
 
-    const allTags = flattenTlv(collected.length ? collected : gpoTlv);
+    const recordsTlv = collected.length ? collected : gpoTlv;
+    const allTags = flattenTlv(recordsTlv);
     log(`All tags read from card (${allTags.length}): ${allTags.map((t) => `${t.tag}=${t.value}`).join(" ")}`);
+
+    const cardTag = (tag: string) => {
+      const node = findTag(recordsTlv, tag);
+      return node ? encodeTlv(tag, node.value) : null;
+    };
+    const buildField55 = (gac?: { cid?: Uint8Array; atc?: Uint8Array; ac?: Uint8Array; iad?: Uint8Array }) => {
+      const parts = [
+        aip ? encodeTlv("82", aip) : null,
+        encodeTlv("84", aid),
+        encodeTlv("95", terminalTags["95"]),
+        encodeTlv("9A", terminalTags["9A"]),
+        encodeTlv("9C", terminalTags["9C"]),
+        encodeTlv("5F2A", terminalTags["5F2A"]),
+        cardTag("5F34"), // PAN Sequence Number
+        encodeTlv("9F02", terminalTags["9F02"]),
+        encodeTlv("9F03", terminalTags["9F03"]),
+        gac?.iad ? encodeTlv("9F10", gac.iad) : cardTag("9F10"),
+        encodeTlv("9F1A", terminalTags["9F1A"]),
+        gac?.ac ? encodeTlv("9F26", gac.ac) : cardTag("9F26"),
+        gac?.cid ? encodeTlv("9F27", gac.cid) : cardTag("9F27"),
+        encodeTlv("9F33", terminalTags["9F33"]),
+        encodeTlv("9F34", terminalTags["9F34"]),
+        encodeTlv("9F35", terminalTags["9F35"]),
+        gac?.atc ? encodeTlv("9F36", gac.atc) : cardTag("9F36"),
+        encodeTlv("9F37", terminalTags["9F37"]),
+        encodeTlv("9F06", aid), // AID known to the terminal — same value as 84 here
+        cardTag("50"), // Application Label
+        cardTag("9F12"), // Application Preferred Name
+        encodeTlv("9B", terminalTags["9B"]),
+        cardTag("5F28"), // Issuer Country Code
+        encodeTlv("4F", aid), // AID from the card's DF Name — same value as 84/9F06 here
+        encodeTlv("9F41", terminalTags["9F41"]),
+        cardTag("9F6E"), // Form Factor Indicator — rarely present on physical cards
+        encodeTlv("9F15", terminalTags["9F15"]),
+      ].filter((p): p is Uint8Array => p !== null);
+
+      return bytesToHex(concat(...parts));
+    };
+
+    emvData = buildField55();
 
     // 4. GENERATE AC — only possible if the card's records carry a CDOL1 (tag 8C). Some synthetic/
     // test fixtures won't have one; real cards always do, UNLESS the GPO's PDOL was filled with a
     // zero/placeholder amount and the card chose a limited "fast path" read as a result.
-    let emvData: string | undefined;
     const cdol1Node = findTag(collected.length ? collected : gpoTlv, "8C");
     if (cdol1Node) {
       const cdol1Data = buildPdolData(cdol1Node.value, terminalTags);
@@ -248,42 +290,7 @@ export async function readEmvCard(
           // Tag set + order verified against the real EDC SDK's rfTags.json config
           // (edc-sdk/pax's EmvTransaction.kt:getTagList) — not our own invention. A few tags that
           // config includes are skipped: 9F7C (Merchant Custom Data) has no defined use case here.
-          const recordsTlv = collected.length ? collected : gpoTlv;
-          const cardTag = (tag: string) => {
-            const node = findTag(recordsTlv, tag);
-            return node ? encodeTlv(tag, node.value) : null;
-          };
-          const parts = [
-            aip ? encodeTlv("82", aip) : null,
-            encodeTlv("84", aid),
-            encodeTlv("95", terminalTags["95"]),
-            encodeTlv("9A", terminalTags["9A"]),
-            encodeTlv("9C", terminalTags["9C"]),
-            encodeTlv("5F2A", terminalTags["5F2A"]),
-            cardTag("5F34"), // PAN Sequence Number
-            encodeTlv("9F02", terminalTags["9F02"]),
-            encodeTlv("9F03", terminalTags["9F03"]),
-            iad ? encodeTlv("9F10", iad) : null,
-            encodeTlv("9F1A", terminalTags["9F1A"]),
-            encodeTlv("9F26", ac),
-            cid ? encodeTlv("9F27", cid) : null,
-            encodeTlv("9F33", terminalTags["9F33"]),
-            encodeTlv("9F34", terminalTags["9F34"]),
-            encodeTlv("9F35", terminalTags["9F35"]),
-            atc ? encodeTlv("9F36", atc) : null,
-            encodeTlv("9F37", terminalTags["9F37"]),
-            encodeTlv("9F06", aid), // AID known to the terminal — same value as 84 here
-            cardTag("50"), // Application Label
-            cardTag("9F12"), // Application Preferred Name
-            encodeTlv("9B", terminalTags["9B"]),
-            cardTag("5F28"), // Issuer Country Code
-            encodeTlv("4F", aid), // AID from the card's DF Name — same value as 84/9F06 here
-            encodeTlv("9F41", terminalTags["9F41"]),
-            cardTag("9F6E"), // Form Factor Indicator — rarely present on physical cards
-            encodeTlv("9F15", terminalTags["9F15"]),
-          ].filter((p): p is Uint8Array => p !== null);
-
-          emvData = bytesToHex(concat(...parts));
+          emvData = buildField55({ cid, atc, ac, iad });
           log(`Field 55 assembled (${emvData.length / 2} byte): ${emvData}`);
         } else {
           log(`GENERATE AC returned 9000 but no cryptogram in response — emvData left empty`);
@@ -292,7 +299,7 @@ export async function readEmvCard(
         log(`GENERATE AC failed (SW ${gac.sw}) — emvData left empty`);
       }
     } else {
-      log(`No CDOL1 (8C) in card records — skipping GENERATE AC (emvData left empty).`);
+      log(`No CDOL1 (8C) in card records — skipping GENERATE AC, using read tags for emvData.`);
     }
 
     return {

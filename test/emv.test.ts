@@ -67,6 +67,20 @@ describe("readEmvCard", () => {
     expect(card.scheme).toBe("Visa");
     expect(card.aid).toBe(bytesToHex(VISA_AID));
     expect(card.cardholderName).toBe("CARD/HOLDER");
+    expect(card.emvData).toBeDefined();
+  });
+
+  it("still emits partial emvData when the card does not expose CDOL1", async () => {
+    const card = await readEmvCard(scriptedCard);
+    const nodes = parseTlv(hexToBytes(card.emvData!));
+
+    expect(bytesToHex(findTag(nodes, "84")!.value)).toBe(bytesToHex(VISA_AID));
+    expect(findTag(nodes, "95")).not.toBeNull();
+    expect(findTag(nodes, "9F02")).not.toBeNull();
+    expect(findTag(nodes, "9F26")).toBeNull();
+    expect(findTag(nodes, "9F27")).toBeNull();
+    expect(findTag(nodes, "9F36")).toBeNull();
+    expect(findTag(nodes, "9F10")).toBeNull();
   });
 
   it("throws a helpful error when PPSE fails", async () => {
