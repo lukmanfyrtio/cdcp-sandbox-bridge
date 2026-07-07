@@ -137,5 +137,27 @@ describe("readEmvCard", () => {
     }
     // 9F7C (Merchant Custom Data) is intentionally never emitted — no defined use case.
     expect(findTag(nodes, "9F7C")).toBeNull();
+
+    // Below the contactless PIN floor limit (Rp 1,000,000): No CVM Performed.
+    expect(bytesToHex(findTag(nodes, "9F34")!.value)).toBe("1F0002");
+  });
+
+  it("sets CVM Results to Online PIN when the amount is at/above the PIN floor limit", async () => {
+    const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
+    const recordWithCdol1 = tlv("70", concat(tlv("57", hexToBytes(TRACK2_HEX)), tlv("8C", hexToBytes(CDOL1_HEX))));
+    const gacResponse = tlv("80", hexToBytes("80" + "0001" + "1122334455667788" + "060A03A09000"));
+
+    const scriptedCardWithGac: Transceive = async (capdu) => {
+      if (startsWith(capdu, "00A40400" + "0E")) return withSw(ppseResponse);
+      if (startsWith(capdu, "00A40400" + "07")) return withSw(new Uint8Array(0));
+      if (startsWith(capdu, "80A80000")) return withSw(gpoResponse);
+      if (startsWith(capdu, "00B201" + "0C")) return withSw(recordWithCdol1);
+      if (startsWith(capdu, "80AE8000")) return withSw(gacResponse);
+      return hexToBytes("6A82");
+    };
+
+    const card = await readEmvCard(scriptedCardWithGac, 1_000_000); // exactly at the floor limit
+    const nodes = parseTlv(hexToBytes(card.emvData!));
+    expect(bytesToHex(findTag(nodes, "9F34")!.value)).toBe("020002");
   });
 });
