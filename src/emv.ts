@@ -20,6 +20,12 @@ export interface CardData {
    * Undefined if the card had no CDOL1 (GAC skipped) — see readEmvCard for why.
    */
   emvData?: string;
+  /**
+   * Every tag/value pair actually present in the card's GPO response + records (and, if it ran,
+   * the GENERATE AC response) — a raw dump for exploring what a real card carries, beyond just the
+   * curated fields above. Tag order is depth-first / read order, duplicates possible across records.
+   */
+  allTags?: { tag: string; value: string }[];
 }
 
 function splitSw(rapdu: Uint8Array): { data: Uint8Array; sw: string } {
@@ -66,6 +72,16 @@ export function parseTrack2(track2Hex: string): { pan: string; expiryYYMM: strin
   return { pan, expiryYYMM, track2: h };
 }
 
+/** Flat tag/value dump of a TLV tree, depth-first, for diagnostic logging and exploration. */
+function flattenTlv(nodes: TlvNode[]): { tag: string; value: string }[] {
+  const out: { tag: string; value: string }[] = [];
+  for (const n of nodes) {
+    out.push({ tag: n.tag, value: bytesToHex(n.value) });
+    if (n.children.length) out.push(...flattenTlv(n.children));
+  }
+  return out;
+}
+
 function extractFromRecords(nodes: TlvNode[]): Partial<CardData> {
   const out: Partial<CardData> = {};
 
@@ -87,7 +103,9 @@ function extractFromRecords(nodes: TlvNode[]): Partial<CardData> {
     const expNode = findTag(nodes, "5F24"); // YYMMDD (BCD)
     if (expNode) out.expiryYYMM = bytesToHex(expNode.value).slice(0, 4);
   }
-  const nameNode = findTag(nodes, "5F20");
+  // 5F20 (Cardholder Name) is the normal tag; 9F0B (Cardholder Name Extended) only appears when the
+  // name is too long for 5F20 (>26 chars) and should be preferred over it when both are present.
+  const nameNode = findTag(nodes, "9F0B") ?? findTag(nodes, "5F20");
   if (nameNode) {
     const name = new TextDecoder().decode(nameNode.value).trim();
     if (name) out.cardholderName = name;
@@ -148,8 +166,13 @@ export async function readEmvCard(
     }
     const fciTlv = parseTlv(sel.data);
 
+    // Generate once, up front, so the PDOL fill (GPO) and CDOL1 fill (GENERATE AC) agree on the
+    // real amount — a zero/placeholder PDOL amount makes some cards pick a limited "fast path"
+    // read with no CDOL1 at all, silently skipping GENERATE AC for what is actually a real sale.
+    const terminalTags = generateTerminalTags(amountRupiah);
+
     // 2. GET PROCESSING OPTIONS
-    const gpo = splitSw(await transceive(buildGpo(fciTlv)));
+    const gpo = splitSw(await transceive(buildGpo(fciTlv, terminalTags)));
     if (gpo.sw !== "9000") {
       lastError = `GPO failed for ${aidHex} (SW ${gpo.sw})`;
       continue;
@@ -179,7 +202,13 @@ export async function readEmvCard(
       for (const entry of parseAfl(afl)) {
         for (let rec = entry.firstRecord; rec <= entry.lastRecord; rec++) {
           const rr = splitSw(await transceive(readRecord(rec, entry.sfi)));
-          if (rr.sw === "9000" && rr.data.length) collected.push(...parseTlv(rr.data));
+          if (rr.sw === "9000" && rr.data.length) {
+            const recordNodes = parseTlv(rr.data);
+            collected.push(...recordNodes);
+            log(`READ RECORD sfi=${entry.sfi} rec=${rec} OK — tags: ${recordNodes.map((n) => n.tag).join(",") || "(none)"}`);
+          } else {
+            log(`READ RECORD sfi=${entry.sfi} rec=${rec} FAILED (SW ${rr.sw})`);
+          }
         }
       }
     }
@@ -192,12 +221,15 @@ export async function readEmvCard(
     log(`PAN ${extracted.pan.slice(0, 6)}******${extracted.pan.slice(-4)}, exp ${extracted.expiryYYMM}, scheme ${schemeFromAid(aidHex)}`);
     if (extracted.cardholderName) log(`Cardholder name: ${extracted.cardholderName}`);
 
+    const allTags = flattenTlv(collected.length ? collected : gpoTlv);
+    log(`All tags read from card (${allTags.length}): ${allTags.map((t) => `${t.tag}=${t.value}`).join(" ")}`);
+
     // 4. GENERATE AC — only possible if the card's records carry a CDOL1 (tag 8C). Some synthetic/
-    // test fixtures won't have one; real cards always do.
+    // test fixtures won't have one; real cards always do, UNLESS the GPO's PDOL was filled with a
+    // zero/placeholder amount and the card chose a limited "fast path" read as a result.
     let emvData: string | undefined;
     const cdol1Node = findTag(collected.length ? collected : gpoTlv, "8C");
     if (cdol1Node) {
-      const terminalTags = generateTerminalTags(amountRupiah);
       const cdol1Data = buildPdolData(cdol1Node.value, terminalTags);
       log(`CDOL1 found (${cdol1Node.value.length} byte) — sending GENERATE AC (ARQC) for amount ${amountRupiah}`);
 
@@ -205,23 +237,50 @@ export async function readEmvCard(
       if (gac.sw === "9000") {
         const { cid, atc, ac, iad } = parseGenerateAcResponse(gac.data);
         if (ac) {
+          // Decoded, not raw — the response's own TLV shape (Format 1 vs 2) differs per card, but
+          // these are always the same 4 logical fields regardless, so the dump is consistent.
+          allTags.push({ tag: "9F26", value: bytesToHex(ac) });
+          if (cid) allTags.push({ tag: "9F27", value: bytesToHex(cid) });
+          if (atc) allTags.push({ tag: "9F36", value: bytesToHex(atc) });
+          if (iad) allTags.push({ tag: "9F10", value: bytesToHex(iad) });
           log(`GENERATE AC OK — cryptogram ${bytesToHex(ac)}, CID=${cid ? bytesToHex(cid) : "?"}, ATC=${atc ? bytesToHex(atc) : "?"}`);
 
-          const aidTlv = encodeTlv("84", aid);
+          // Tag set + order verified against the real EDC SDK's rfTags.json config
+          // (edc-sdk/pax's EmvTransaction.kt:getTagList) — not our own invention. A few tags that
+          // config includes are skipped: 9F7C (Merchant Custom Data) has no defined use case here.
+          const recordsTlv = collected.length ? collected : gpoTlv;
+          const cardTag = (tag: string) => {
+            const node = findTag(recordsTlv, tag);
+            return node ? encodeTlv(tag, node.value) : null;
+          };
           const parts = [
             aip ? encodeTlv("82", aip) : null,
-            aidTlv,
-            encodeTlv("9F37", terminalTags["9F37"]),
+            encodeTlv("84", aid),
+            encodeTlv("95", terminalTags["95"]),
             encodeTlv("9A", terminalTags["9A"]),
             encodeTlv("9C", terminalTags["9C"]),
             encodeTlv("5F2A", terminalTags["5F2A"]),
+            cardTag("5F34"), // PAN Sequence Number
             encodeTlv("9F02", terminalTags["9F02"]),
+            encodeTlv("9F03", terminalTags["9F03"]),
+            iad ? encodeTlv("9F10", iad) : null,
             encodeTlv("9F1A", terminalTags["9F1A"]),
-            encodeTlv("95", terminalTags["95"]),
             encodeTlv("9F26", ac),
             cid ? encodeTlv("9F27", cid) : null,
-            iad ? encodeTlv("9F10", iad) : null,
+            encodeTlv("9F33", terminalTags["9F33"]),
+            encodeTlv("9F34", terminalTags["9F34"]),
+            encodeTlv("9F35", terminalTags["9F35"]),
             atc ? encodeTlv("9F36", atc) : null,
+            encodeTlv("9F37", terminalTags["9F37"]),
+            encodeTlv("9F06", aid), // AID known to the terminal — same value as 84 here
+            cardTag("50"), // Application Label
+            cardTag("9F12"), // Application Preferred Name
+            encodeTlv("9B", terminalTags["9B"]),
+            cardTag("5F28"), // Issuer Country Code
+            encodeTlv("4F", aid), // AID from the card's DF Name — same value as 84/9F06 here
+            encodeTlv("9F41", terminalTags["9F41"]),
+            cardTag("9F6E"), // Form Factor Indicator — rarely present on physical cards
+            encodeTlv("9F15", terminalTags["9F15"]),
           ].filter((p): p is Uint8Array => p !== null);
 
           emvData = bytesToHex(concat(...parts));
@@ -233,7 +292,7 @@ export async function readEmvCard(
         log(`GENERATE AC failed (SW ${gac.sw}) — emvData left empty`);
       }
     } else {
-      log("No CDOL1 in card records — skipping GENERATE AC (emvData left empty)");
+      log(`No CDOL1 (8C) in card records — skipping GENERATE AC (emvData left empty).`);
     }
 
     return {
@@ -242,6 +301,7 @@ export async function readEmvCard(
       cardholderName: extracted.cardholderName,
       track2: extracted.track2,
       scheme: schemeFromAid(aidHex),
+      allTags,
       aid: aidHex,
       emvData,
     };

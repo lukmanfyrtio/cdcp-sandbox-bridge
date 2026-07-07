@@ -17,12 +17,24 @@ export function readRecord(record: number, sfi: number): Uint8Array {
   return Uint8Array.of(0x00, 0xb2, record, p2, 0x00);
 }
 
+// EMV requires a per-transaction counter (9F41) that increments across the terminal's lifetime,
+// not per card. In-memory only — resets on bridge restart, which is fine for a sandbox but would
+// need real persistence on an actual terminal.
+let transactionSequenceCounter = 0;
+
 /**
  * Terminal-generated values for a real transaction — amount comes from the user's actual input
  * (must be known before GENERATE AC, since the cryptogram is computed over it), the rest are
  * either fixed sandbox terminal config or generated fresh per transaction (date, unpredictable
- * number). Reused for BOTH the CDOL1 fill (sent to the card) and the field 55 tag collection
- * (sent to the host) so the two always agree on what was actually used.
+ * number, sequence counter). Reused for BOTH the CDOL1 fill (sent to the card) and the field 55
+ * tag collection (sent to the host) so the two always agree on what was actually used.
+ *
+ * Tag set mirrors the real EDC SDK's rfTags.json config (verified against edc-sdk/pax's
+ * EmvTransaction.kt) as closely as a sandbox with no real CVM/risk-management engine can:
+ *  - 95 (TVR) and 9B (TSI): sandbox performs no real offline data auth / CVM / risk management,
+ *    so both are left as "nothing performed" rather than falsely claiming checks that didn't run.
+ *  - 9F34 (CVM Results): fixed at "No CVM Performed" since the bridge only handles contactless
+ *    taps, which for these amounts typically go through without cardholder verification.
  */
 export function generateTerminalTags(amountRupiah: number): Record<string, Uint8Array> {
   const amountCents = Math.max(0, Math.round(amountRupiah));
@@ -33,6 +45,7 @@ export function generateTerminalTags(amountRupiah: number): Record<string, Uint8
     2,
     "0"
   )}${String(d.getDate()).padStart(2, "0")}`;
+  transactionSequenceCounter = (transactionSequenceCounter + 1) % 100000000;
 
   return {
     "9F02": hexToBytes(amountCents.toString().padStart(12, "0")), // Amount, Authorised (BCD)
@@ -44,8 +57,13 @@ export function generateTerminalTags(amountRupiah: number): Record<string, Uint8
     "9C": hexToBytes("00"), // Transaction Type — 00 = purchase
     "9F37": un, // Unpredictable Number
     "9F66": hexToBytes("36000000"), // TTQ (Visa qVSDC + contactless read)
-    "9F35": hexToBytes("22"), // Terminal Type
+    "9F35": hexToBytes("22"), // Terminal Type — attended, online-capable
     "9F40": hexToBytes("6000000000"), // Additional Terminal Capabilities
+    "9F33": hexToBytes("E0F8C8"), // Terminal Capabilities — common full-featured default
+    "9F34": hexToBytes("1F0002"), // CVM Results — No CVM Performed, successful
+    "9B": hexToBytes("0000"), // Transaction Status Information — no offline steps performed
+    "9F15": hexToBytes("5999"), // Merchant Category Code — sandbox default (misc. retail)
+    "9F41": hexToBytes(transactionSequenceCounter.toString().padStart(8, "0")), // Transaction Sequence Counter
   };
 }
 
@@ -95,12 +113,19 @@ export function buildGenerateAc(cdol1Data: Uint8Array): Uint8Array {
   return concat(hexToBytes("80AE8000"), Uint8Array.of(cdol1Data.length), cdol1Data, Uint8Array.of(0x00));
 }
 
-/** Build a GET PROCESSING OPTIONS APDU. If the AID's FCI carries a PDOL, fill it; else send empty 83 00. */
-export function buildGpo(selectAidResponseTlv: TlvNode[]): Uint8Array {
+/**
+ * Build a GET PROCESSING OPTIONS APDU. If the AID's FCI carries a PDOL, fill it with the real
+ * terminalTags for this transaction; else send empty 83 00.
+ *
+ * `terminalTags` MUST reflect the real amount (not the generateTerminalTags(0) default) — some
+ * contactless cards pick a limited/no-CDOL "fast path" when PDOL amount is zero, since that reads
+ * as a non-financial/zero-value tap, which silently skips GENERATE AC for a real transaction.
+ */
+export function buildGpo(selectAidResponseTlv: TlvNode[], terminalTags: Record<string, Uint8Array> = generateTerminalTags(0)): Uint8Array {
   const pdolNode = findFirst(selectAidResponseTlv, "9F38");
   let commandData: Uint8Array;
   if (pdolNode && pdolNode.value.length > 0) {
-    const pdolValues = buildPdolData(pdolNode.value);
+    const pdolValues = buildPdolData(pdolNode.value, terminalTags);
     commandData = concat(Uint8Array.of(0x83, pdolValues.length), pdolValues);
   } else {
     commandData = hexToBytes("8300");
