@@ -22,13 +22,6 @@ export function readRecord(record: number, sfi: number): Uint8Array {
 // need real persistence on an actual terminal.
 let transactionSequenceCounter = 0;
 
-// Contactless floor limit: below this, tap goes through with no CVM; at/above it, online PIN is
-// required (matches real network/BI contactless CVM-required-limit practice). This only affects
-// the CVM Results tag (9F34) for field-55/CDOL1 consistency — the bridge has no keypad itself, so
-// actually collecting and encrypting the PIN happens in cdcp-sandbox-web's submitSale.
-// Keep in sync with cdcp-sandbox-web/src/cards/testCards.ts's PIN_FLOOR_LIMIT_IDR.
-export const PIN_FLOOR_LIMIT_IDR = 1_000_000;
-
 /**
  * Terminal-generated values for a real transaction — amount comes from the user's actual input
  * (must be known before GENERATE AC, since the cryptogram is computed over it), the rest are
@@ -37,15 +30,12 @@ export const PIN_FLOOR_LIMIT_IDR = 1_000_000;
  * tag collection (sent to the host) so the two always agree on what was actually used.
  *
  * Tag set mirrors the real EDC SDK's rfTags.json config (verified against edc-sdk/pax's
- * EmvTransaction.kt) as closely as a sandbox with no real CVM/risk-management engine can:
- *  - 95 (TVR) and 9B (TSI): sandbox performs no real offline data auth / risk management, so both
- *    are left as "nothing performed" rather than falsely claiming checks that didn't run.
- *  - 9F34 (CVM Results): reflects the floor-limit rule above — "No CVM Performed" below it,
- *    "Online PIN, successful" at/above it.
+ * EmvTransaction.kt). Notably absent: 95 (TVR), 9B (TSI), 9F34 (CVM Results) — those depend on the
+ * card's own data (CVM List, expiry, usage control) which isn't known until after READ RECORD, so
+ * they're computed in emv.ts (via cvm.ts/tvr.ts) once records are in hand, not generated here.
  */
 export function generateTerminalTags(amountRupiah: number): Record<string, Uint8Array> {
   const amountCents = Math.max(0, Math.round(amountRupiah));
-  const pinPerformed = amountRupiah >= PIN_FLOOR_LIMIT_IDR;
   const un = new Uint8Array(4);
   for (let i = 0; i < 4; i++) un[i] = Math.floor(Math.random() * 256);
   const d = new Date();
@@ -60,16 +50,16 @@ export function generateTerminalTags(amountRupiah: number): Record<string, Uint8
     "9F03": hexToBytes("000000000000"), // Amount, Other
     "9F1A": hexToBytes("0360"), // Terminal Country Code (ID)
     "5F2A": hexToBytes("0360"), // Transaction Currency Code (IDR)
-    "95": hexToBytes("0000000000"), // Terminal Verification Results — sandbox does no real risk mgmt
     "9A": hexToBytes(dateHex), // Transaction Date YYMMDD
     "9C": hexToBytes("00"), // Transaction Type — 00 = purchase
     "9F37": un, // Unpredictable Number
     "9F66": hexToBytes("36000000"), // TTQ (Visa qVSDC + contactless read)
     "9F35": hexToBytes("22"), // Terminal Type — attended, online-capable
     "9F40": hexToBytes("6000000000"), // Additional Terminal Capabilities
-    "9F33": hexToBytes("E0F8C8"), // Terminal Capabilities — common full-featured default
-    "9F34": hexToBytes(pinPerformed ? "020002" : "1F0002"), // CVM Results — Online PIN vs No CVM Performed
-    "9B": hexToBytes("0000"), // Transaction Status Information — no offline steps performed
+    // Terminal Capabilities — only claims what this bridge can actually execute: signature +
+    // online PIN + no-CVM-required (no offline PIN VERIFY support), no SDA/DDA/CDA (oda.ts never
+    // runs real verification). Was E0F8C8, which over-claimed both.
+    "9F33": hexToBytes("E01800"),
     "9F15": hexToBytes("5999"), // Merchant Category Code — sandbox default (misc. retail)
     "9F41": hexToBytes(transactionSequenceCounter.toString().padStart(8, "0")), // Transaction Sequence Counter
   };

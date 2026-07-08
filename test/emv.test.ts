@@ -91,6 +91,8 @@ describe("readEmvCard", () => {
   it("runs GENERATE AC and assembles field-55-equivalent emvData when the card has a CDOL1", async () => {
     // CDOL1: 9F02(6) 9F03(6) 9F1A(2) 95(5) 5F2A(2) 9A(3) 9C(1) 9F37(4) — a typical Visa CDOL1.
     const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
+    // CVM List (8E): amountX=0, amountY=0, single rule — No CVM Required (0x1F), Always (0x00).
+    const CVM_LIST_NO_CVM_HEX = "00000000" + "00000000" + "1F00";
     // Include some optional card-sourced field-55 tags (5F34, 50) but not others (9F12, 5F28, 9F6E),
     // so the test can verify both "read from card when present" and "skipped when absent".
     const recordWithCdol1 = tlv(
@@ -98,6 +100,7 @@ describe("readEmvCard", () => {
       concat(
         tlv("57", hexToBytes(TRACK2_HEX)),
         tlv("8C", hexToBytes(CDOL1_HEX)),
+        tlv("8E", hexToBytes(CVM_LIST_NO_CVM_HEX)),
         tlv("5F34", hexToBytes("00")),
         tlv("50", new TextEncoder().encode("VISA"))
       )
@@ -152,13 +155,21 @@ describe("readEmvCard", () => {
     // 9F7C (Merchant Custom Data) is intentionally never emitted — no defined use case.
     expect(findTag(nodes, "9F7C")).toBeNull();
 
-    // Below the contactless PIN floor limit (Rp 1,000,000): No CVM Performed.
+    // Card's CVM List says: No CVM Required, Always — this is real CVM evaluation against the
+    // card's own data now, not an amount heuristic.
     expect(bytesToHex(findTag(nodes, "9F34")!.value)).toBe("1F0002");
+    expect(card.pinRequired).toBe(false);
   });
 
-  it("sets CVM Results to Online PIN when the amount is at/above the PIN floor limit", async () => {
+  it("selects Online PIN from the card's CVM List when the amount is over the list's amount X", async () => {
+    // CVM List: amountX=1,000,000 (0x000F4240), amountY=0. Rule 1: continue-on-fail + Online PIN
+    // (0x02) if over X (0x07). Rule 2: No CVM Required (0x1F), Always (0x00).
     const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
-    const recordWithCdol1 = tlv("70", concat(tlv("57", hexToBytes(TRACK2_HEX)), tlv("8C", hexToBytes(CDOL1_HEX))));
+    const CVM_LIST_HEX = "000F4240" + "00000000" + "8207" + "1F00";
+    const recordWithCdol1 = tlv(
+      "70",
+      concat(tlv("57", hexToBytes(TRACK2_HEX)), tlv("8C", hexToBytes(CDOL1_HEX)), tlv("8E", hexToBytes(CVM_LIST_HEX)))
+    );
     const gacResponse = tlv("80", hexToBytes("80" + "0001" + "1122334455667788" + "060A03A09000"));
 
     const scriptedCardWithGac: Transceive = async (capdu) => {
@@ -170,8 +181,61 @@ describe("readEmvCard", () => {
       return hexToBytes("6A82");
     };
 
-    const card = await readEmvCard(scriptedCardWithGac, 1_000_000); // exactly at the floor limit
+    const card = await readEmvCard(scriptedCardWithGac, 1_000_000); // exactly at (over-or-equal) X
     const nodes = parseTlv(hexToBytes(card.emvData!));
-    expect(bytesToHex(findTag(nodes, "9F34")!.value)).toBe("020002");
+    // method=0x02 (Online PIN), condition=0x07 (over X), result=0x00 (unknown/not available) — NOT
+    // 0x02 "successful": the issuer hasn't confirmed the PIN yet at this point (that happens
+    // downstream in cdcp-sandbox-web), so the terminal must not claim success prematurely.
+    expect(bytesToHex(findTag(nodes, "9F34")!.value)).toBe("020700");
+    expect(card.pinRequired).toBe(true);
+  });
+
+  it("falls through to No CVM Required when the amount is under the list's amount X", async () => {
+    const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
+    const CVM_LIST_HEX = "000F4240" + "00000000" + "8207" + "1F00";
+    const recordWithCdol1 = tlv(
+      "70",
+      concat(tlv("57", hexToBytes(TRACK2_HEX)), tlv("8C", hexToBytes(CDOL1_HEX)), tlv("8E", hexToBytes(CVM_LIST_HEX)))
+    );
+    const gacResponse = tlv("80", hexToBytes("80" + "0001" + "1122334455667788" + "060A03A09000"));
+
+    const scriptedCardWithGac: Transceive = async (capdu) => {
+      if (startsWith(capdu, "00A40400" + "0E")) return withSw(ppseResponse);
+      if (startsWith(capdu, "00A40400" + "07")) return withSw(new Uint8Array(0));
+      if (startsWith(capdu, "80A80000")) return withSw(gpoResponse);
+      if (startsWith(capdu, "00B201" + "0C")) return withSw(recordWithCdol1);
+      if (startsWith(capdu, "80AE8000")) return withSw(gacResponse);
+      return hexToBytes("6A82");
+    };
+
+    // Under X: rule 1's condition doesn't apply, so it falls through to rule 2 regardless of the
+    // continue-on-fail bit — that bit only matters once a condition actually applied.
+    const card = await readEmvCard(scriptedCardWithGac, 500_000);
+    const nodes = parseTlv(hexToBytes(card.emvData!));
+    expect(bytesToHex(findTag(nodes, "9F34")!.value)).toBe("1F0002");
+    expect(card.pinRequired).toBe(false);
+  });
+
+  it("classifies a declined (AAC) GENERATE AC response instead of treating it as approved", async () => {
+    const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
+    const CVM_LIST_NO_CVM_HEX = "00000000" + "00000000" + "1F00";
+    const recordWithCdol1 = tlv(
+      "70",
+      concat(tlv("57", hexToBytes(TRACK2_HEX)), tlv("8C", hexToBytes(CDOL1_HEX)), tlv("8E", hexToBytes(CVM_LIST_NO_CVM_HEX)))
+    );
+    // CID top bits 00 = AAC (declined) — same shape as a normal Format-1 response, different type.
+    const gacResponse = tlv("80", hexToBytes("00" + "0001" + "1122334455667788" + "060A03A09000"));
+
+    const scriptedCardWithGac: Transceive = async (capdu) => {
+      if (startsWith(capdu, "00A40400" + "0E")) return withSw(ppseResponse);
+      if (startsWith(capdu, "00A40400" + "07")) return withSw(new Uint8Array(0));
+      if (startsWith(capdu, "80A80000")) return withSw(gpoResponse);
+      if (startsWith(capdu, "00B201" + "0C")) return withSw(recordWithCdol1);
+      if (startsWith(capdu, "80AE8000")) return withSw(gacResponse);
+      return hexToBytes("6A82");
+    };
+
+    const card = await readEmvCard(scriptedCardWithGac, 150000);
+    expect(card.cryptogramType).toBe("AAC");
   });
 });

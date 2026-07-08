@@ -2,8 +2,11 @@
 // the cardholder data (PAN, expiry, Track2) needed by the sandbox. Card-scheme quirks (esp. GPO/PDOL)
 // may need small tweaks per acquirer — the transceive abstraction keeps this unit-testable.
 import { buildGenerateAc, buildGpo, buildPdolData, generateTerminalTags, parseAfl, readRecord, selectAid, selectPpse } from "./apdu";
+import { CvmOutcome, encodeCvmResults, evaluateCvm } from "./cvm";
 import { bytesToHex, concat, hexToBytes } from "./hex";
+import { performOda } from "./oda";
 import { findAllTags, findTag, parseTlv, TlvNode } from "./tlv";
+import { buildTsi, buildTvr, checkAuc, checkExpiry, evaluateTerminalRiskManagement } from "./tvr";
 
 export type Transceive = (capdu: Uint8Array) => Promise<Uint8Array>;
 
@@ -26,6 +29,20 @@ export interface CardData {
    * curated fields above. Tag order is depth-first / read order, duplicates possible across records.
    */
   allTags?: { tag: string; value: string }[];
+  /**
+   * GENERATE AC response CID, classified: "ARQC" means the card wants online authorization (the
+   * expected case here, since GENERATE AC always requests it) — but the card can still return "TC"
+   * (offline approve) or "AAC" (declined) regardless of what was requested. Callers MUST check this
+   * before submitting to sale_trx: an "AAC" card has already declined and should not be treated as
+   * an online-bound transaction.
+   */
+  cryptogramType?: "TC" | "ARQC" | "AAC";
+  /**
+   * Real CVM outcome from the card's own CVM List (cvm.ts) — true only when Online PIN was actually
+   * selected. Downstream (cdcp-sandbox-web) should use this instead of any amount-only heuristic to
+   * decide whether to show a PIN pad, since it reflects what the cryptogram was actually computed over.
+   */
+  pinRequired?: boolean;
 }
 
 function splitSw(rapdu: Uint8Array): { data: Uint8Array; sw: string } {
@@ -134,6 +151,21 @@ function parseGenerateAcResponse(data: Uint8Array): { cid?: Uint8Array; atc?: Ui
   };
 }
 
+/** CID top 2 bits (bits 8-7) carry the cryptogram type; lower 6 bits are advice/reason flags. */
+function classifyCid(cid?: Uint8Array): "TC" | "ARQC" | "AAC" | undefined {
+  if (!cid || cid.length < 1) return undefined;
+  switch (cid[0] & 0xc0) {
+    case 0x40:
+      return "TC";
+    case 0x80:
+      return "ARQC";
+    case 0x00:
+      return "AAC";
+    default:
+      return undefined; // 0xC0 top-bits combination is RFU
+  }
+}
+
 /**
  * Run the full read flow, including GENERATE AC when the card's records carry a CDOL1 — this is
  * what actually produces field 55 (ICC data) for the host, not just the PAN/Track2 a plain
@@ -146,6 +178,7 @@ export async function readEmvCard(
   log: (msg: string) => void = () => {}
 ): Promise<CardData> {
   let emvData: string | undefined;
+  let cryptogramType: CardData["cryptogramType"];
 
   // 1. SELECT PPSE
   const ppse = splitSw(await transceive(selectPpse()));
@@ -227,15 +260,51 @@ export async function readEmvCard(
     const allTags = flattenTlv(recordsTlv);
     log(`All tags read from card (${allTags.length}): ${allTags.map((t) => `${t.tag}=${t.value}`).join(" ")}`);
 
+    // Terminal Action Analysis inputs — all depend on card data only available now that records
+    // are read (CVM List, expiry dates, usage control), so this can't happen any earlier than here.
+    const cvmOutcome: CvmOutcome = evaluateCvm(findTag(recordsTlv, "8E")?.value ?? null, amountRupiah);
+    const expiry = checkExpiry(findTag(recordsTlv, "5F24")?.value, findTag(recordsTlv, "5F25")?.value);
+    // 5F28 (Issuer Country Code) absent → default domestic:true. Understates the usage-control
+    // restriction check rather than overstating it — a safer default than assuming international.
+    const issuerCountry = findTag(recordsTlv, "5F28")?.value;
+    const domestic = issuerCountry ? bytesToHex(issuerCountry) === bytesToHex(terminalTags["9F1A"]) : true;
+    const auc = checkAuc(findTag(recordsTlv, "9F07")?.value, domestic);
+    const odaResult = performOda(recordsTlv);
+    const trm = evaluateTerminalRiskManagement(amountRupiah);
+    const tvrBytes = buildTvr({
+      odaPerformed: odaResult.performed,
+      expired: expiry.expired,
+      notYetEffective: expiry.notYetEffective,
+      serviceAllowed: auc.serviceAllowed,
+      cvmOutcome,
+      trm,
+    });
+    const cvmResultsBytes = encodeCvmResults(cvmOutcome);
+    log(
+      `CVM: method=${cvmOutcome.method.toString(16)} condition=${cvmOutcome.condition.toString(16)} result=${cvmOutcome.result} — TVR=${bytesToHex(
+        tvrBytes
+      )}`
+    );
+
+    // Real 9F34/95 for the CDOL1 fill — terminalTags itself keeps the pre-GPO placeholder-free set
+    // from apdu.ts; only the CDOL1 fill and buildField55 need the card-derived values.
+    const finalTerminalTags = {
+      ...terminalTags,
+      "95": tvrBytes,
+      "9B": buildTsi({ cvmVerificationPerformed: cvmOutcome.verificationPerformed, cardRiskManagementPerformed: false }),
+      "9F34": cvmResultsBytes,
+    };
+
     const cardTag = (tag: string) => {
       const node = findTag(recordsTlv, tag);
       return node ? encodeTlv(tag, node.value) : null;
     };
     const buildField55 = (gac?: { cid?: Uint8Array; atc?: Uint8Array; ac?: Uint8Array; iad?: Uint8Array }) => {
+      const tsiBytes = buildTsi({ cvmVerificationPerformed: cvmOutcome.verificationPerformed, cardRiskManagementPerformed: !!gac?.ac });
       const parts = [
         aip ? encodeTlv("82", aip) : null,
         encodeTlv("84", aid),
-        encodeTlv("95", terminalTags["95"]),
+        encodeTlv("95", tvrBytes),
         encodeTlv("9A", terminalTags["9A"]),
         encodeTlv("9C", terminalTags["9C"]),
         encodeTlv("5F2A", terminalTags["5F2A"]),
@@ -247,18 +316,19 @@ export async function readEmvCard(
         gac?.ac ? encodeTlv("9F26", gac.ac) : cardTag("9F26"),
         gac?.cid ? encodeTlv("9F27", gac.cid) : cardTag("9F27"),
         encodeTlv("9F33", terminalTags["9F33"]),
-        encodeTlv("9F34", terminalTags["9F34"]),
+        encodeTlv("9F34", cvmResultsBytes),
         encodeTlv("9F35", terminalTags["9F35"]),
         gac?.atc ? encodeTlv("9F36", gac.atc) : cardTag("9F36"),
         encodeTlv("9F37", terminalTags["9F37"]),
         encodeTlv("9F06", aid), // AID known to the terminal — same value as 84 here
         cardTag("50"), // Application Label
         cardTag("9F12"), // Application Preferred Name
-        encodeTlv("9B", terminalTags["9B"]),
+        encodeTlv("9B", tsiBytes),
         cardTag("5F28"), // Issuer Country Code
         encodeTlv("4F", aid), // AID from the card's DF Name — same value as 84/9F06 here
         encodeTlv("9F41", terminalTags["9F41"]),
         cardTag("9F6E"), // Form Factor Indicator — rarely present on physical cards
+        terminalTags["9F7C"] ? encodeTlv("9F7C", terminalTags["9F7C"]) : null,
         encodeTlv("9F15", terminalTags["9F15"]),
       ].filter((p): p is Uint8Array => p !== null);
 
@@ -272,7 +342,7 @@ export async function readEmvCard(
     // zero/placeholder amount and the card chose a limited "fast path" read as a result.
     const cdol1Node = findTag(collected.length ? collected : gpoTlv, "8C");
     if (cdol1Node) {
-      const cdol1Data = buildPdolData(cdol1Node.value, terminalTags);
+      const cdol1Data = buildPdolData(cdol1Node.value, finalTerminalTags);
       log(`CDOL1 found (${cdol1Node.value.length} byte) — sending GENERATE AC (ARQC) for amount ${amountRupiah}`);
 
       const gac = splitSw(await transceive(buildGenerateAc(cdol1Data)));
@@ -285,7 +355,15 @@ export async function readEmvCard(
           if (cid) allTags.push({ tag: "9F27", value: bytesToHex(cid) });
           if (atc) allTags.push({ tag: "9F36", value: bytesToHex(atc) });
           if (iad) allTags.push({ tag: "9F10", value: bytesToHex(iad) });
-          log(`GENERATE AC OK — cryptogram ${bytesToHex(ac)}, CID=${cid ? bytesToHex(cid) : "?"}, ATC=${atc ? bytesToHex(atc) : "?"}`);
+          cryptogramType = classifyCid(cid);
+          log(
+            `GENERATE AC OK — cryptogram ${bytesToHex(ac)}, CID=${cid ? bytesToHex(cid) : "?"} (${cryptogramType ?? "unrecognised"}), ATC=${
+              atc ? bytesToHex(atc) : "?"
+            }`
+          );
+          if (cryptogramType === "AAC") {
+            log("Card declined offline (AAC) — do not submit this to sale_trx as an approved/online transaction.");
+          }
 
           // Tag set + order verified against the real EDC SDK's rfTags.json config
           // (edc-sdk/pax's EmvTransaction.kt:getTagList) — not our own invention. A few tags that
@@ -311,6 +389,8 @@ export async function readEmvCard(
       allTags,
       aid: aidHex,
       emvData,
+      cryptogramType,
+      pinRequired: cvmOutcome.onlinePinRequested,
     };
   }
 
