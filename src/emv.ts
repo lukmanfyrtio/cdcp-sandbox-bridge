@@ -1,10 +1,10 @@
 // Orchestrates the EMV contactless read flow over an abstract transceive function, and extracts
 // the cardholder data (PAN, expiry, Track2) needed by the sandbox. Card-scheme quirks (esp. GPO/PDOL)
 // may need small tweaks per acquirer — the transceive abstraction keeps this unit-testable.
-import { buildGenerateAc, buildGpo, buildPdolData, generateTerminalTags, parseAfl, readRecord, selectAid, selectPpse } from "./apdu";
+import { AflEntry, buildGenerateAc, buildGpo, buildPdolData, generateTerminalTags, parseAfl, readRecord, selectAid, selectPpse } from "./apdu";
 import { CvmOutcome, encodeCvmResults, evaluateCvm } from "./cvm";
 import { bytesToHex, concat, hexToBytes } from "./hex";
-import { performOda } from "./oda";
+import { CaKeyTable, emptyCaKeyTable, performOda } from "./oda";
 import { findAllTags, findTag, parseTlv, TlvNode } from "./tlv";
 import { buildTsi, buildTvr, checkAuc, checkExpiry, evaluateTerminalRiskManagement } from "./tvr";
 
@@ -175,7 +175,8 @@ function classifyCid(cid?: Uint8Array): "TC" | "ARQC" | "AAC" | undefined {
 export async function readEmvCard(
   transceive: Transceive,
   amountRupiah = 0,
-  log: (msg: string) => void = () => {}
+  log: (msg: string) => void = () => {},
+  caKeys: CaKeyTable = emptyCaKeyTable
 ): Promise<CardData> {
   let emvData: string | undefined;
   let cryptogramType: CardData["cryptogramType"];
@@ -258,21 +259,25 @@ export async function readEmvCard(
     }
 
     // 3. READ RECORDs per AFL
-    if (afl) {
-      for (const entry of parseAfl(afl)) {
-        for (let rec = entry.firstRecord; rec <= entry.lastRecord; rec++) {
-          const rr = splitSw(await transceive(readRecord(rec, entry.sfi)));
-          if (rr.sw === "9000" && rr.data.length) {
-            const recordNodes = parseTlv(rr.data);
-            collected.push(...recordNodes);
-            log(
-              `Step 3/4 (READ RECORD): sfi=${entry.sfi} rec=${rec} OK — tags: ${
-                recordNodes.map((n) => n.tag).join(",") || "(none)"
-              }`
-            );
-          } else {
-            log(`Step 3/4 (READ RECORD): sfi=${entry.sfi} rec=${rec} FAILED (SW ${rr.sw})`);
-          }
+    const aflEntries: AflEntry[] = afl ? parseAfl(afl) : [];
+    // Raw (unparsed) bytes per record, kept alongside `collected`'s parsed TLV tree — SDA (oda.ts)
+    // needs the exact record bytes including each record's own template tag+length, which the
+    // parsed tree doesn't preserve.
+    const rawRecords: { sfi: number; record: number; raw: Uint8Array }[] = [];
+    for (const entry of aflEntries) {
+      for (let rec = entry.firstRecord; rec <= entry.lastRecord; rec++) {
+        const rr = splitSw(await transceive(readRecord(rec, entry.sfi)));
+        if (rr.sw === "9000" && rr.data.length) {
+          const recordNodes = parseTlv(rr.data);
+          collected.push(...recordNodes);
+          rawRecords.push({ sfi: entry.sfi, record: rec, raw: rr.data });
+          log(
+            `Step 3/4 (READ RECORD): sfi=${entry.sfi} rec=${rec} OK — tags: ${
+              recordNodes.map((n) => n.tag).join(",") || "(none)"
+            }`
+          );
+        } else {
+          log(`Step 3/4 (READ RECORD): sfi=${entry.sfi} rec=${rec} FAILED (SW ${rr.sw})`);
         }
       }
     }
@@ -302,10 +307,18 @@ export async function readEmvCard(
     const issuerCountry = findTag(recordsTlv, "5F28")?.value;
     const domestic = issuerCountry ? bytesToHex(issuerCountry) === bytesToHex(terminalTags["9F1A"]) : true;
     const auc = checkAuc(findTag(recordsTlv, "9F07")?.value, domestic);
-    const odaResult = performOda(recordsTlv);
+    const odaResult = performOda({ aip, aflEntries, rawRecords, recordsTlv, aidHex, caKeys });
+    log(
+      `Step 3/4 (READ RECORD): ODA: ${
+        odaResult.performed
+          ? `${odaResult.method} → ${odaResult.valid ? "VALID" : "INVALID"}`
+          : `not performed (${odaResult.reason})`
+      }`
+    );
     const trm = evaluateTerminalRiskManagement(amountRupiah);
     const tvrBytes = buildTvr({
       odaPerformed: odaResult.performed,
+      sdaFailed: odaResult.performed && odaResult.method === "SDA" && odaResult.valid === false,
       expired: expiry.expired,
       notYetEffective: expiry.notYetEffective,
       serviceAllowed: auc.serviceAllowed,

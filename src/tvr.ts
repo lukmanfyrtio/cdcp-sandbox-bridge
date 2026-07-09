@@ -66,6 +66,8 @@ export function evaluateTerminalRiskManagement(amountRupiah: number): TerminalRi
 
 export interface TvrInputs {
   odaPerformed: boolean;
+  /** True only when SDA ran (odaPerformed) and its signature check came back invalid. */
+  sdaFailed: boolean;
   expired: boolean;
   notYetEffective: boolean;
   serviceAllowed: boolean;
@@ -74,7 +76,9 @@ export interface TvrInputs {
 }
 
 export function buildTvr(i: TvrInputs): Uint8Array {
-  const byte1 = i.odaPerformed ? 0x00 : B8; // b8 "ODA not performed" — honest, oda.ts never runs real verification yet
+  // b8 "ODA not performed" (honest default — no CAPK on file, or card doesn't offer it) / b7 "SDA
+  // failed" (oda.ts did run SDA but the signature didn't check out).
+  const byte1 = (i.odaPerformed ? 0x00 : B8) | (i.sdaFailed ? B7 : 0);
   const byte2 = (i.expired ? B7 : 0) | (i.notYetEffective ? B6 : 0) | (!i.serviceAllowed ? B5 : 0);
   const byte3 = (i.cvmOutcome.verificationFailed ? B8 : 0) | (i.cvmOutcome.onlinePinRequested ? B3 : 0);
   const byte4 = B4 | (i.trm.exceedsFloorLimit ? B8 : 0); // B4 "merchant forced online" always set

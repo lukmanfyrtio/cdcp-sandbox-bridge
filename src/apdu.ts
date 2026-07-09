@@ -148,12 +148,14 @@ export interface AflEntry {
   sfi: number;
   firstRecord: number;
   lastRecord: number;
+  /** Of this entry's records, how many (starting from firstRecord) feed SDA/DDA — see oda.ts. */
+  offlineAuthRecordCount: number;
 }
 
 export function parseAfl(afl: Uint8Array): AflEntry[] {
   const entries: AflEntry[] = [];
   for (let i = 0; i + 3 < afl.length; i += 4) {
-    entries.push({ sfi: afl[i] >> 3, firstRecord: afl[i + 1], lastRecord: afl[i + 2] });
+    entries.push({ sfi: afl[i] >> 3, firstRecord: afl[i + 1], lastRecord: afl[i + 2], offlineAuthRecordCount: afl[i + 3] });
   }
   return entries;
 }
