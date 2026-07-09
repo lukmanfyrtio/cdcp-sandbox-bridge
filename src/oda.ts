@@ -18,7 +18,7 @@
 // unimplemented (performOda simply never sets method to "DDA"/"CDA") rather than approximated.
 import { createHash } from "crypto";
 import { AflEntry } from "./apdu";
-import { bytesToHex, concat } from "./hex";
+import { bytesToHex, concat, hexToBytes } from "./hex";
 import { findTag, TlvNode } from "./tlv";
 
 export interface CaPublicKey {
@@ -41,6 +41,30 @@ export function caKeyTableFromList(keys: CaPublicKey[]): CaKeyTable {
       return keys.find((k) => k.rid.toUpperCase() === rid.toUpperCase() && k.index === index) ?? null;
     },
   };
+}
+
+/** One entry of a `capks.format.json`-shaped table — same field names real EMV kernel SDKs use
+ * (see e.g. a PAX-based app's `assets/capks.format.json`), all hex strings. Lets a self-generated
+ * test CAPK (see src/tools/generateTestCapk.ts) drop in with zero format translation. */
+export interface CapkJsonEntry {
+  CAPKName?: string;
+  RID: string;
+  CAPKIndex: string;
+  CAPKModulus: string;
+  CAPKExponent: string;
+  CAPKChecksum?: string;
+  CAPKExpirationDate?: string;
+}
+
+export function caKeyTableFromJson(entries: CapkJsonEntry[]): CaKeyTable {
+  return caKeyTableFromList(
+    entries.map((e) => ({
+      rid: e.RID,
+      index: parseInt(e.CAPKIndex, 16),
+      modulus: hexToBytes(e.CAPKModulus),
+      exponent: hexToBytes(e.CAPKExponent),
+    }))
+  );
 }
 
 export interface OdaResult {

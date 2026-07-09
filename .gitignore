@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.log
 .env
+
+# self-issued test CA private key (src/tools/generateTestCapk.ts) — not a real secret, but no
+# reason to publish it either; the public CAPK table (sandbox-capks.format.json) is fine to commit
+test-fixtures/sandbox-ca-private-key.json
