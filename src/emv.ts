@@ -337,7 +337,7 @@ export async function readEmvCard(
     const finalTerminalTags = {
       ...terminalTags,
       "95": tvrBytes,
-      "9B": buildTsi({ cvmVerificationPerformed: cvmOutcome.verificationPerformed, cardRiskManagementPerformed: false }),
+      "9B": buildTsi({ odaPerformed: odaResult.performed, cvmVerificationPerformed: cvmOutcome.verificationPerformed, cardRiskManagementPerformed: false }),
       "9F34": cvmResultsBytes,
     };
 
@@ -346,7 +346,11 @@ export async function readEmvCard(
       return node ? encodeTlv(tag, node.value) : null;
     };
     const buildField55 = (gac?: { cid?: Uint8Array; atc?: Uint8Array; ac?: Uint8Array; iad?: Uint8Array }) => {
-      const tsiBytes = buildTsi({ cvmVerificationPerformed: cvmOutcome.verificationPerformed, cardRiskManagementPerformed: !!gac?.ac });
+      const tsiBytes = buildTsi({
+        odaPerformed: odaResult.performed,
+        cvmVerificationPerformed: cvmOutcome.verificationPerformed,
+        cardRiskManagementPerformed: !!gac?.ac,
+      });
       const parts = [
         aip ? encodeTlv("82", aip) : null,
         encodeTlv("84", aid),

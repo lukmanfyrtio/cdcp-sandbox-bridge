@@ -49,6 +49,7 @@ describe("buildTvr / buildTsi", () => {
   it("sets only the always-on bits when nothing else applies", () => {
     const tvr = buildTvr({
       odaPerformed: false,
+      sdaFailed: false,
       expired: false,
       notYetEffective: false,
       serviceAllowed: true,
@@ -62,6 +63,7 @@ describe("buildTvr / buildTsi", () => {
   it("sets the floor-limit bit and the online-PIN-requested bit", () => {
     const tvr = buildTvr({
       odaPerformed: false,
+      sdaFailed: false,
       expired: false,
       notYetEffective: false,
       serviceAllowed: true,
@@ -74,6 +76,7 @@ describe("buildTvr / buildTsi", () => {
   it("sets expiry, usage-control, and CVM-failed bits", () => {
     const tvr = buildTvr({
       odaPerformed: false,
+      sdaFailed: false,
       expired: true,
       notYetEffective: false,
       serviceAllowed: false,
@@ -83,8 +86,29 @@ describe("buildTvr / buildTsi", () => {
     expect(bytesToHex(tvr)).toBe("8050800800" /* byte2 b7|b5=50 (expired + service not allowed), byte3 b8=80 (cvm failed) */);
   });
 
-  it("TSI reflects performed steps — terminal risk management always, CVM/card risk management only when actually run", () => {
-    expect(bytesToHex(buildTsi({ cvmVerificationPerformed: false, cardRiskManagementPerformed: false }))).toBe("0800");
-    expect(bytesToHex(buildTsi({ cvmVerificationPerformed: true, cardRiskManagementPerformed: true }))).toBe("6800");
+  it("sets the SDA-failed bit only when ODA was performed and came back invalid", () => {
+    const tvr = buildTvr({
+      odaPerformed: true,
+      sdaFailed: true,
+      expired: false,
+      notYetEffective: false,
+      serviceAllowed: true,
+      cvmOutcome: noCvmOutcome,
+      trm: { exceedsFloorLimit: false },
+    });
+    // byte1: b8 stays 0 (ODA WAS performed) but b7=40 (SDA failed) — 40, not 80|40.
+    expect(bytesToHex(tvr)).toBe("4000000800");
+  });
+
+  it("TSI reflects performed steps — terminal risk management always, CVM/card risk management/ODA only when actually run", () => {
+    expect(bytesToHex(buildTsi({ odaPerformed: false, cvmVerificationPerformed: false, cardRiskManagementPerformed: false }))).toBe(
+      "0800"
+    );
+    expect(bytesToHex(buildTsi({ odaPerformed: false, cvmVerificationPerformed: true, cardRiskManagementPerformed: true }))).toBe(
+      "6800"
+    );
+    expect(bytesToHex(buildTsi({ odaPerformed: true, cvmVerificationPerformed: true, cardRiskManagementPerformed: true }))).toBe(
+      "E800"
+    );
   });
 });

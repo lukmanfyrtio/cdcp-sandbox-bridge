@@ -87,11 +87,14 @@ export function buildTvr(i: TvrInputs): Uint8Array {
 }
 
 export interface TsiInputs {
+  odaPerformed: boolean;
   cvmVerificationPerformed: boolean;
   cardRiskManagementPerformed: boolean;
 }
 
 export function buildTsi(i: TsiInputs): Uint8Array {
-  const byte1 = (i.cvmVerificationPerformed ? B7 : 0) | (i.cardRiskManagementPerformed ? B6 : 0) | B4; // B4: terminal risk management always runs
+  // b8 "Offline data authentication was performed" (oda.ts's performOda() result) / b7 CVM / b6 card
+  // risk management / b4 terminal risk management (always runs, per evaluateTerminalRiskManagement).
+  const byte1 = (i.odaPerformed ? B8 : 0) | (i.cvmVerificationPerformed ? B7 : 0) | (i.cardRiskManagementPerformed ? B6 : 0) | B4;
   return Uint8Array.of(byte1, 0x00);
 }
