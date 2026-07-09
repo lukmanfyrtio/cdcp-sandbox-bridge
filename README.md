@@ -8,15 +8,29 @@ Android phone (Remote Smart Card Reader app, taps card)
       │  VPCD protocol over TCP (:35963)
       ▼
 cdcp-sandbox-bridge   ── reads EMV: SELECT PPSE → SELECT AID → GPO → READ RECORD → parse Track2/PAN
-      │  WebSocket (:4001)
+      │  WebSocket (:4001) — card_read payload is AES-256-GCM encrypted, see below
       ▼
-cdcp-sandbox-web  (listens, fills the card, runs the existing DUKPT + sale_trx flow)
+cdcp-sandbox-web  (decrypts right before use, fills the card, runs the DUKPT + sale_trx flow)
 ```
 
 ## ⚠️ Real card data
 
 This reads **real PANs** from real cards. Only tap **your own test cards**. The PAN is masked in the web
 UI and never persisted; still, treat this as a bench tool, not something to point at customer cards.
+
+## WebSocket encryption
+
+The `card_read` event (PAN/Track2/Field-55) is encrypted (AES-256-GCM) before it goes out over the
+WebSocket — the web app only decrypts it right at the point it's about to build the `sale_trx`
+request, not on arrival. This matters because `bridgeUrl` can point anywhere (see
+`wss://ws.lukman.site` default in the web app), not just `localhost`.
+
+- On startup, if `WS_ENCRYPT_KEY` isn't set, the bridge **generates a fresh key every run** and
+  prints it to the console — paste that into the web app's **"WS Encryption Key (hex)"** field.
+- Set `WS_ENCRYPT_KEY=<64 hex chars>` (32 bytes) in the environment to keep the same key across
+  restarts, so you don't have to re-paste it every time.
+- Wrong or missing key on the web side → the tap fails with a decryption error, not a silent empty
+  card — see `src/wsCrypto.ts` (bridge) / `cdcp-sandbox-web/src/crypto/wsCrypto.ts` (web).
 
 ## Run
 

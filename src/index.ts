@@ -7,9 +7,11 @@ import { CardData, readEmvCard } from "./emv";
 import { bytesToHex } from "./hex";
 import { createVpcdServer, VpcdConnection } from "./vpcd";
 import { WsHub } from "./ws";
+import { loadOrGenerateKey } from "./wsCrypto";
 
 const VPCD_PORT = Number(process.env.VPCD_PORT) || 35963;
 const WS_PORT = Number(process.env.WS_PORT) || 4001;
+const wsEncryptionKey = loadOrGenerateKey(process.env.WS_ENCRYPT_KEY);
 
 const httpServer = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -42,7 +44,7 @@ const httpServer = http.createServer((req, res) => {
   res.writeHead(404).end();
 });
 
-const hub = new WsHub(httpServer);
+const hub = new WsHub(httpServer, wsEncryptionKey);
 httpServer.listen(WS_PORT, () => console.log(`WebSocket + debug HTTP on http://localhost:${WS_PORT}`));
 
 /** Poll the connected reader for a card, read it when present, then wait for it to leave. */
