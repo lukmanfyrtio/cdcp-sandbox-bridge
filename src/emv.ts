@@ -186,13 +186,13 @@ export async function readEmvCard(
   const ppseTlv = parseTlv(ppse.data);
   const aidNodes = findAllTags(ppseTlv, "4F");
   if (aidNodes.length === 0) throw new Error("No AID found in PPSE directory");
-  log(`PPSE OK — ${aidNodes.length} AID(s) offered`);
+  log(`Step 1/4 (Application Selection): PPSE OK — ${aidNodes.length} AID(s) offered`);
 
   let lastError = "";
   for (const aidNode of aidNodes) {
     const aid = aidNode.value;
     const aidHex = bytesToHex(aid);
-    log(`SELECT AID ${aidHex}`);
+    log(`Step 1/4 (Application Selection): SELECT AID ${aidHex}`);
 
     const sel = splitSw(await transceive(selectAid(aid)));
     if (sel.sw !== "9000") {
@@ -230,7 +230,7 @@ export async function readEmvCard(
       const aipNode = findTag(gpoTlv, "82");
       if (aipNode) aip = aipNode.value;
     }
-    log(`GPO OK — AIP=${aip ? bytesToHex(aip) : "?"}`);
+    log(`Step 2/4 (GET PROCESSING OPTIONS): GPO OK — AIP=${aip ? bytesToHex(aip) : "?"}`);
 
     // Some contactless cards (notably Visa qVSDC "fast" flow) generate the cryptogram as part of
     // GPO itself — template 77 carries 9F26/9F27/9F36/9F10 directly, and the card never exposes a
@@ -248,12 +248,12 @@ export async function readEmvCard(
       };
       cryptogramType = classifyCid(gpoGac.cid);
       log(
-        `GPO already contains the cryptogram (combined GPO/GENERATE AC) — ${bytesToHex(gpoAcNode.value)}, CID=${
-          gpoGac.cid ? bytesToHex(gpoGac.cid) : "?"
-        } (${cryptogramType ?? "unrecognised"})`
+        `Step 2/4 (GET PROCESSING OPTIONS): GPO already contains the cryptogram (combined GPO/GENERATE AC) — ${bytesToHex(
+          gpoAcNode.value
+        )}, CID=${gpoGac.cid ? bytesToHex(gpoGac.cid) : "?"} (${cryptogramType ?? "unrecognised"})`
       );
       if (cryptogramType === "AAC") {
-        log("Card declined offline (AAC) — do not submit this to sale_trx as an approved/online transaction.");
+        log("Step 2/4 (GET PROCESSING OPTIONS): Card declined offline (AAC) — do not submit this to sale_trx as an approved/online transaction.");
       }
     }
 
@@ -265,9 +265,13 @@ export async function readEmvCard(
           if (rr.sw === "9000" && rr.data.length) {
             const recordNodes = parseTlv(rr.data);
             collected.push(...recordNodes);
-            log(`READ RECORD sfi=${entry.sfi} rec=${rec} OK — tags: ${recordNodes.map((n) => n.tag).join(",") || "(none)"}`);
+            log(
+              `Step 3/4 (READ RECORD): sfi=${entry.sfi} rec=${rec} OK — tags: ${
+                recordNodes.map((n) => n.tag).join(",") || "(none)"
+              }`
+            );
           } else {
-            log(`READ RECORD sfi=${entry.sfi} rec=${rec} FAILED (SW ${rr.sw})`);
+            log(`Step 3/4 (READ RECORD): sfi=${entry.sfi} rec=${rec} FAILED (SW ${rr.sw})`);
           }
         }
       }
@@ -278,12 +282,16 @@ export async function readEmvCard(
       lastError = `No PAN found for AID ${aidHex}`;
       continue;
     }
-    log(`PAN ${extracted.pan.slice(0, 6)}******${extracted.pan.slice(-4)}, exp ${extracted.expiryYYMM}, scheme ${schemeFromAid(aidHex)}`);
-    if (extracted.cardholderName) log(`Cardholder name: ${extracted.cardholderName}`);
+    log(
+      `Step 3/4 (READ RECORD): PAN ${extracted.pan.slice(0, 6)}******${extracted.pan.slice(-4)}, exp ${
+        extracted.expiryYYMM
+      }, scheme ${schemeFromAid(aidHex)}`
+    );
+    if (extracted.cardholderName) log(`Step 3/4 (READ RECORD): Cardholder name: ${extracted.cardholderName}`);
 
     const recordsTlv = collected.length ? collected : gpoTlv;
     const allTags = flattenTlv(recordsTlv);
-    log(`All tags read from card (${allTags.length}): ${allTags.map((t) => `${t.tag}=${t.value}`).join(" ")}`);
+    log(`Step 3/4 (READ RECORD): All tags read from card (${allTags.length}): ${allTags.map((t) => `${t.tag}=${t.value}`).join(" ")}`);
 
     // Terminal Action Analysis inputs — all depend on card data only available now that records
     // are read (CVM List, expiry dates, usage control), so this can't happen any earlier than here.
@@ -306,9 +314,9 @@ export async function readEmvCard(
     });
     const cvmResultsBytes = encodeCvmResults(cvmOutcome);
     log(
-      `CVM: method=${cvmOutcome.method.toString(16)} condition=${cvmOutcome.condition.toString(16)} result=${cvmOutcome.result} — TVR=${bytesToHex(
-        tvrBytes
-      )}`
+      `Step 3/4 (READ RECORD): CVM: method=${cvmOutcome.method.toString(16)} condition=${cvmOutcome.condition.toString(
+        16
+      )} result=${cvmOutcome.result} — TVR=${bytesToHex(tvrBytes)}`
     );
 
     // Real 9F34/95 for the CDOL1 fill — terminalTags itself keeps the pre-GPO placeholder-free set
@@ -363,7 +371,12 @@ export async function readEmvCard(
     emvData = buildField55(gpoGac);
     // Note: gpoGac's tags (9F26/9F27/9F36/9F10) are already in allTags via flattenTlv above, since
     // they came from the GPO template-77 node pushed into `collected` — no need to add them again.
-    if (gpoGac) log(`Field 55 assembled (${emvData.length / 2} byte): ${emvData}`);
+    if (gpoGac) {
+      log(
+        `Step 4/4 (GENERATE AC): cryptogram already obtained in Step 2 (combined GPO/GENERATE AC) — nothing further to send`
+      );
+      log(`Step 4/4 (GENERATE AC): Field 55 assembled (${emvData.length / 2} byte): ${emvData}`);
+    }
 
     // 4. GENERATE AC — only possible if the card's records carry a CDOL1 (tag 8C). Some synthetic/
     // test fixtures won't have one; real cards always do, UNLESS the GPO's PDOL was filled with a
@@ -373,7 +386,7 @@ export async function readEmvCard(
     const cdol1Node = gpoGac ? null : findTag(collected.length ? collected : gpoTlv, "8C");
     if (cdol1Node) {
       const cdol1Data = buildPdolData(cdol1Node.value, finalTerminalTags);
-      log(`CDOL1 found (${cdol1Node.value.length} byte) — sending GENERATE AC (ARQC) for amount ${amountRupiah}`);
+      log(`Step 4/4 (GENERATE AC): CDOL1 found (${cdol1Node.value.length} byte) — sending GENERATE AC (ARQC) for amount ${amountRupiah}`);
 
       const gac = splitSw(await transceive(buildGenerateAc(cdol1Data)));
       if (gac.sw === "9000") {
@@ -387,27 +400,27 @@ export async function readEmvCard(
           if (iad) allTags.push({ tag: "9F10", value: bytesToHex(iad) });
           cryptogramType = classifyCid(cid);
           log(
-            `GENERATE AC OK — cryptogram ${bytesToHex(ac)}, CID=${cid ? bytesToHex(cid) : "?"} (${cryptogramType ?? "unrecognised"}), ATC=${
-              atc ? bytesToHex(atc) : "?"
-            }`
+            `Step 4/4 (GENERATE AC): GENERATE AC OK — cryptogram ${bytesToHex(ac)}, CID=${
+              cid ? bytesToHex(cid) : "?"
+            } (${cryptogramType ?? "unrecognised"}), ATC=${atc ? bytesToHex(atc) : "?"}`
           );
           if (cryptogramType === "AAC") {
-            log("Card declined offline (AAC) — do not submit this to sale_trx as an approved/online transaction.");
+            log("Step 4/4 (GENERATE AC): Card declined offline (AAC) — do not submit this to sale_trx as an approved/online transaction.");
           }
 
           // Tag set + order verified against the real EDC SDK's rfTags.json config
           // (edc-sdk/pax's EmvTransaction.kt:getTagList) — not our own invention. A few tags that
           // config includes are skipped: 9F7C (Merchant Custom Data) has no defined use case here.
           emvData = buildField55({ cid, atc, ac, iad });
-          log(`Field 55 assembled (${emvData.length / 2} byte): ${emvData}`);
+          log(`Step 4/4 (GENERATE AC): Field 55 assembled (${emvData.length / 2} byte): ${emvData}`);
         } else {
-          log(`GENERATE AC returned 9000 but no cryptogram in response — emvData left empty`);
+          log(`Step 4/4 (GENERATE AC): GENERATE AC returned 9000 but no cryptogram in response — emvData left empty`);
         }
       } else {
-        log(`GENERATE AC failed (SW ${gac.sw}) — emvData left empty`);
+        log(`Step 4/4 (GENERATE AC): GENERATE AC failed (SW ${gac.sw}) — emvData left empty`);
       }
-    } else {
-      log(`No CDOL1 (8C) in card records — skipping GENERATE AC, using read tags for emvData.`);
+    } else if (!gpoGac) {
+      log(`Step 4/4 (GENERATE AC): No CDOL1 (8C) in card records and no cryptogram from GPO — skipping GENERATE AC, using read tags for emvData.`);
     }
 
     return {
