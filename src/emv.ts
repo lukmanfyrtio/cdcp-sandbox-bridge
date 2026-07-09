@@ -232,6 +232,31 @@ export async function readEmvCard(
     }
     log(`GPO OK — AIP=${aip ? bytesToHex(aip) : "?"}`);
 
+    // Some contactless cards (notably Visa qVSDC "fast" flow) generate the cryptogram as part of
+    // GPO itself — template 77 carries 9F26/9F27/9F36/9F10 directly, and the card never exposes a
+    // CDOL1 (8C) in its records because the terminal will never need to build a GENERATE AC command.
+    // Must be detected here, before the CDOL1 check below, or this looks identical to "no cryptogram
+    // at all" even though the card already returned a valid (possibly ARQC) AC.
+    const gpoAcNode = findTag(gpoTlv, "9F26");
+    let gpoGac: { cid?: Uint8Array; atc?: Uint8Array; ac?: Uint8Array; iad?: Uint8Array } | undefined;
+    if (gpoAcNode) {
+      gpoGac = {
+        ac: gpoAcNode.value,
+        cid: findTag(gpoTlv, "9F27")?.value,
+        atc: findTag(gpoTlv, "9F36")?.value,
+        iad: findTag(gpoTlv, "9F10")?.value,
+      };
+      cryptogramType = classifyCid(gpoGac.cid);
+      log(
+        `GPO already contains the cryptogram (combined GPO/GENERATE AC) — ${bytesToHex(gpoAcNode.value)}, CID=${
+          gpoGac.cid ? bytesToHex(gpoGac.cid) : "?"
+        } (${cryptogramType ?? "unrecognised"})`
+      );
+      if (cryptogramType === "AAC") {
+        log("Card declined offline (AAC) — do not submit this to sale_trx as an approved/online transaction.");
+      }
+    }
+
     // 3. READ RECORDs per AFL
     if (afl) {
       for (const entry of parseAfl(afl)) {
@@ -335,12 +360,17 @@ export async function readEmvCard(
       return bytesToHex(concat(...parts));
     };
 
-    emvData = buildField55();
+    emvData = buildField55(gpoGac);
+    // Note: gpoGac's tags (9F26/9F27/9F36/9F10) are already in allTags via flattenTlv above, since
+    // they came from the GPO template-77 node pushed into `collected` — no need to add them again.
+    if (gpoGac) log(`Field 55 assembled (${emvData.length / 2} byte): ${emvData}`);
 
     // 4. GENERATE AC — only possible if the card's records carry a CDOL1 (tag 8C). Some synthetic/
     // test fixtures won't have one; real cards always do, UNLESS the GPO's PDOL was filled with a
-    // zero/placeholder amount and the card chose a limited "fast path" read as a result.
-    const cdol1Node = findTag(collected.length ? collected : gpoTlv, "8C");
+    // zero/placeholder amount and the card chose a limited "fast path" read as a result — or, as
+    // gpoGac above covers, the card already produced the cryptogram inside GPO and will never
+    // expose a CDOL1 at all, since the terminal has no follow-up command left to build.
+    const cdol1Node = gpoGac ? null : findTag(collected.length ? collected : gpoTlv, "8C");
     if (cdol1Node) {
       const cdol1Data = buildPdolData(cdol1Node.value, finalTerminalTags);
       log(`CDOL1 found (${cdol1Node.value.length} byte) — sending GENERATE AC (ARQC) for amount ${amountRupiah}`);

@@ -216,6 +216,46 @@ describe("readEmvCard", () => {
     expect(card.pinRequired).toBe(false);
   });
 
+  it("recognises a cryptogram returned directly in the GPO response (combined GPO/GENERATE AC, no CDOL1)", async () => {
+    // Mirrors a real Visa qVSDC contactless read: GPO template 77 already carries 9F26/9F27/9F36/9F10,
+    // and the record that follows has no CDOL1 (8C) at all — the terminal never gets to send a
+    // separate GENERATE AC command because the card already produced the cryptogram in GPO.
+    const gpoWithAc = tlv(
+      "77",
+      concat(
+        tlv("82", hexToBytes("0020")),
+        tlv("94", hexToBytes("08040400")),
+        tlv("57", hexToBytes(TRACK2_HEX)),
+        tlv("9F10", hexToBytes("06011203A02000")),
+        tlv("9F26", hexToBytes("CD290A2EDE0B12A0")),
+        tlv("9F27", hexToBytes("80")), // top bits 10 = ARQC
+        tlv("9F36", hexToBytes("0053"))
+      )
+    );
+    // Follow-up READ RECORD per AFL — no CDOL1, no Track2 here (already came from GPO).
+    const followUpRecord = tlv("70", concat(tlv("9F07", hexToBytes("C000")), tlv("5F28", hexToBytes("0360"))));
+
+    const scriptedCardGpoAc: Transceive = async (capdu) => {
+      if (startsWith(capdu, "00A40400" + "0E")) return withSw(ppseResponse);
+      if (startsWith(capdu, "00A40400" + "07")) return withSw(new Uint8Array(0));
+      if (startsWith(capdu, "80A80000")) return withSw(gpoWithAc);
+      if (startsWith(capdu, "00B204" + "0C")) return withSw(followUpRecord);
+      return hexToBytes("6A82");
+    };
+
+    const card = await readEmvCard(scriptedCardGpoAc, 150000);
+    // The bug this guards against: cryptogramType silently staying undefined even though the card
+    // already returned a valid ARQC, because the old code only classified CID inside the explicit
+    // "CDOL1 found → send GENERATE AC" branch.
+    expect(card.cryptogramType).toBe("ARQC");
+
+    const nodes = parseTlv(hexToBytes(card.emvData!));
+    expect(bytesToHex(findTag(nodes, "9F26")!.value)).toBe("CD290A2EDE0B12A0");
+    expect(bytesToHex(findTag(nodes, "9F27")!.value)).toBe("80");
+    expect(bytesToHex(findTag(nodes, "9F36")!.value)).toBe("0053");
+    expect(bytesToHex(findTag(nodes, "9F10")!.value)).toBe("06011203A02000");
+  });
+
   it("classifies a declined (AAC) GENERATE AC response instead of treating it as approved", async () => {
     const CDOL1_HEX = "9F0206" + "9F0306" + "9F1A02" + "9505" + "5F2A02" + "9A03" + "9C01" + "9F3704";
     const CVM_LIST_NO_CVM_HEX = "00000000" + "00000000" + "1F00";
