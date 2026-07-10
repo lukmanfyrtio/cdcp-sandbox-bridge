@@ -28,7 +28,13 @@ const httpServer = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
-      let card: CardData = { pan: "4111111111111111", expiryYYMM: "2812", scheme: "Visa", cardholderName: "SANDBOX/TEST" };
+      let card: CardData = {
+        amount: 0,
+        cardModeType: "RF",
+        pan: "4111111111111111",
+        trackData: { track2Data: "4111111111111111D2812101000000000000" },
+        isPinBlock: true,
+      };
       try {
         if (body.trim()) card = { ...card, ...JSON.parse(body) };
       } catch {

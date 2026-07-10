@@ -11,17 +11,24 @@ import { URL } from "url";
 import { WebSocketServer, WebSocket } from "ws";
 import { encryptJson, EncryptedPayload } from "./wsCrypto";
 
+// Same shape as sandbox-reader's com.lib.core.emv.CardData (Gson-serialized as-is, see
+// sandbox-reader/src/main/java/com/cashlez/sandboxreader/ws/WsBridgeClient.kt) — the bridge relays
+// this verbatim (still encrypted) for real taps, so it never needs to know this shape itself except
+// for the /debug/simulate-card fixture below, which fabricates one to match.
+export interface TrackData {
+  track1Data?: string | null;
+  track2Data?: string | null;
+  track3Data?: string | null;
+}
+
 export interface CardData {
-  pan: string;
-  expiryYYMM: string;
-  cardholderName?: string;
-  track2?: string;
-  scheme?: string;
-  aid?: string;
-  emvData?: string;
-  allTags?: { tag: string; value: string }[];
-  cryptogramType?: "TC" | "ARQC" | "AAC";
-  pinRequired?: boolean;
+  amount?: number;
+  cardModeType?: "IC" | "MAG" | "RF" | null;
+  pan?: string | null;
+  trackData?: TrackData | null;
+  iccData?: string | null;
+  pinBlock?: string | null;
+  isPinBlock?: boolean;
 }
 
 export type BridgeEvent =
