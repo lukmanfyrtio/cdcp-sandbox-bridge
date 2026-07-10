@@ -2,7 +2,7 @@
   "name": "cdcp-sandbox-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Bridges an Android phone running vsmartcard 'Remote Smart Card Reader' (VPCD protocol) to the CDCP sandbox web app over WebSocket, reading real contactless card data via NFC.",
+  "description": "Encrypted WebSocket relay between the sandbox-reader Android app (reads real contactless cards via internal NFC) and the CDCP sandbox web app.",
   "type": "commonjs",
   "scripts": {
     "dev": "tsx watch src/index.ts",

@@ -12,5 +12,5 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
-EXPOSE 35963 4001
+EXPOSE 4001
 CMD ["node", "dist/index.js"]

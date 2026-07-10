@@ -1,34 +1,45 @@
 # cdcp-sandbox-bridge
 
-Bridges an Android phone running **vsmartcard "Remote Smart Card Reader"** to the CDCP sandbox web app,
-so you can tap a **real contactless card** and have its data flow into the simulator.
+Encrypted WebSocket relay between the **sandbox-reader** Android app (`edc-sdk/sandbox-reader`,
+reads a **real contactless card** via the phone's internal NFC + its own EMV kernel) and the CDCP
+sandbox web app.
 
 ```
-Android phone (Remote Smart Card Reader app, taps card)
-      │  VPCD protocol over TCP (:35963)
+Android phone (sandbox-reader app, reads card via internal NFC + own EMV kernel)
+      │  WebSocket (:4001) as ?role=reader — card_read payload is AES-256-GCM
+      │  encrypted by the phone itself before it ever reaches this bridge
       ▼
-cdcp-sandbox-bridge   ── reads EMV: SELECT PPSE → SELECT AID → GPO → READ RECORD → parse Track2/PAN
-      │  WebSocket (:4001) — card_read payload is AES-256-GCM encrypted, see below
+cdcp-sandbox-bridge   ── pure relay, never sees plaintext PAN/Track2/Field-55 for a real tap
+      │  WebSocket (:4001) as ?role=web (default)
       ▼
 cdcp-sandbox-web  (decrypts right before use, fills the card, runs the DUKPT + sale_trx flow)
 ```
 
+The bridge no longer talks EMV/APDU or VPCD — that logic now lives in the phone's own EMV kernel
+(edc-sdk). This is just a relay: it forwards `arm_tap` (amount) from the browser to the phone, and
+`card_read` / `waiting_for_card` / `error` from the phone to the browser, keyed by the `role` query
+param on the WebSocket connection.
+
 ## ⚠️ Real card data
 
-This reads **real PANs** from real cards. Only tap **your own test cards**. The PAN is masked in the web
-UI and never persisted; still, treat this as a bench tool, not something to point at customer cards.
+This relays **real PANs** read by the phone. Only tap **your own test cards**. The PAN is masked in
+the web UI and never persisted; still, treat this as a bench tool, not something to point at
+customer cards.
 
 ## WebSocket encryption
 
-The `card_read` event (PAN/Track2/Field-55) is encrypted (AES-256-GCM) before it goes out over the
-WebSocket — the web app only decrypts it right at the point it's about to build the `sale_trx`
-request, not on arrival. This matters because `bridgeUrl` can point anywhere (see
-`wss://ws.lukman.site` default in the web app), not just `localhost`.
+The `card_read` event (PAN/Track2/Field-55) is AES-256-GCM encrypted by the phone itself before it
+sends it — the bridge only relays the ciphertext, and the web app only decrypts it right at the
+point it's about to build the `sale_trx` request. This matters because `bridgeUrl` can point
+anywhere (see `wss://ws.lukman.site` default in the web app), not just `localhost`.
 
-- On startup, if `WS_ENCRYPT_KEY` isn't set, the bridge **generates a fresh key every run** and
-  prints it to the console — paste that into the web app's **"WS Encryption Key (hex)"** field.
-- Set `WS_ENCRYPT_KEY=<64 hex chars>` (32 bytes) in the environment to keep the same key across
-  restarts, so you don't have to re-paste it every time.
+- Set `WS_ENCRYPT_KEY=<64 hex chars>` (32 bytes) in the environment on **both** sides that need to
+  encrypt/decrypt: the phone (`sandbox-reader`'s `ws_enkrip_key` constant) and the web app
+  (`DEFAULT_WS_ENCRYPT_KEY` — see `cdcp-sandbox-web/.env.example` / `docker-compose.yml`). The
+  bridge only needs its own `WS_ENCRYPT_KEY` for the `/debug/simulate-card` fixture below — real
+  taps pass through encrypted end-to-end and the bridge doesn't need the key for those at all.
+- On startup, if `WS_ENCRYPT_KEY` isn't set, the bridge **generates a fresh key every run** (used
+  only for `/debug/simulate-card`) and prints it to the console.
 - Wrong or missing key on the web side → the tap fails with a decryption error, not a silent empty
   card — see `src/wsCrypto.ts` (bridge) / `cdcp-sandbox-web/src/crypto/wsCrypto.ts` (web).
 
@@ -37,32 +48,30 @@ request, not on arrival. This matters because `bridgeUrl` can point anywhere (se
 ### Docker Compose (from parent `cdcp-sandbox/`)
 
 ```
-docker compose up --build       # bridge VPCD on :35963, WebSocket on :4001
+docker compose up --build       # WebSocket + HTTP on :4001
 ```
 
 ### Standalone
 
 ```
 npm install
-npm run dev      # VPCD :35963, WebSocket + HTTP :4001
-npm test         # VPCD framing + EMV/Track2 parsing tests
+npm run dev      # WebSocket + HTTP on :4001
+npm test         # wsCrypto encryption round-trip tests
 ```
 
 ## Phone setup
 
-1. Install **Remote Smart Card Reader** from F-Droid on an Android phone with NFC.
-2. In the app, set Host = your PC's LAN IP, Port = `35963`, and Connect.
-3. On the same PC, make sure inbound TCP `35963` is allowed through the firewall.
-4. In the web app, expand **"Tap kartu asli pakai HP (NFC)"** → **Hubungkan** (`ws://localhost:4001`).
-5. Hold a contactless card **flat and still** against the phone for ~2–3 seconds.
-
-**Tip:** the app's tag timeout is short (~500 ms). If you see `Tag was lost` / `VPCD response timeout`,
-the card moved before the ~6 APDU round-trips finished — hold it steady.
+1. Build & install `sandbox-reader` from `edc-sdk` on an Android phone with NFC.
+2. In the app, set the bridge WebSocket URL (defaults to `wss://ws.lukman.site`) and connect — it
+   joins as `?role=reader`.
+3. In the web app, expand **"Tap kartu asli pakai HP (NFC)"** → **Hubungkan** (joins as the default
+   `?role=web`).
+4. Arm an amount from the web app (or type it directly on the phone) and hold a contactless card
+   **flat and still** against the phone for ~2–3 seconds.
 
 ## Debugging
 
-- The bridge logs every APDU (`→` command, `←` response) plus `Read PAN 4xxxxx****xxxx`.
-- `POST /debug/simulate-card` (JSON `{pan, expiryYYMM, scheme}`) injects a fake card read to test the
-  web integration without hardware.
-- GPO/PDOL handling in `src/apdu.ts` uses sensible terminal defaults; some card schemes may need small
-  tweaks there (TTQ `9F66`, amounts, country/currency).
+- `GET /health` — liveness check.
+- `POST /debug/simulate-card` (JSON `{pan, expiryYYMM, scheme}`) injects a fake, bridge-encrypted
+  `card_read` to test the web integration without a phone/card — this is the one path where the
+  bridge does still hold `WS_ENCRYPT_KEY` and encrypt on its own.
