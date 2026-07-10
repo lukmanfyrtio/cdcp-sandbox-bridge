@@ -52,9 +52,6 @@ export class WsHub {
   private readers = new Set<WebSocket>();
   private webs = new Set<WebSocket>();
   private lastStatus: BridgeEvent = { type: "reader_disconnected" };
-  // Amount the browser armed before the next tap — pushed to readers as they connect/reconnect so
-  // a reader joining after the browser already armed a tap still knows the intended amount.
-  private lastAmount = 0;
   private readonly encryptionKey: Buffer;
 
   constructor(server: http.Server, encryptionKey: Buffer) {
@@ -71,7 +68,12 @@ export class WsHub {
     this.readers.add(ws);
     this.setStatus({ type: "reader_connected" });
     this.setStatus({ type: "waiting_for_card" });
-    ws.send(JSON.stringify({ type: "arm_tap", amount: this.lastAmount }));
+    // Deliberately no eager arm_tap here: a reader that just connected has no business inheriting
+    // whatever amount some unrelated web session armed at any point since this bridge process last
+    // restarted (was a real bug — a stale amount from hours/sessions ago got replayed to a phone
+    // that had never even opened the web app). The web app already re-sends arm_tap on its own
+    // reconnect when a tap is genuinely in flight (see sandboxContext.tsx's awaitingTapRef), so
+    // this bridge doesn't need to remember/replay anything.
 
     ws.on("close", () => {
       this.readers.delete(ws);
@@ -103,7 +105,6 @@ export class WsHub {
       try {
         const msg = JSON.parse(raw.toString());
         if (msg?.type === "arm_tap" && typeof msg.amount === "number") {
-          this.lastAmount = msg.amount;
           this.sendToReaders({ type: "arm_tap", amount: msg.amount });
         }
       } catch {
